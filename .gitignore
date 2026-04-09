@@ -1,0 +1,33 @@
+# 環境變數與金鑰
+.env
+*.key
+
+# 交易所設定（含私鑰）
+config/exchanges/tradexyz_config.yaml
+config/exchanges/hyperliquid_config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+
+# 日誌
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# 測試快取
+.pytest_cache/
+
+CLAUDE.md
+.claude/
+
+README_old.md
+CHANGELOG.md
+AGENTS.md
+
+config/grid/tradexyz_long.yaml
