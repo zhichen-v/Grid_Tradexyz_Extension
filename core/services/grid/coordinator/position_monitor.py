@@ -175,6 +175,11 @@ class PositionMonitor:
                         position=Decimal('0'),
                         entry_price=Decimal('0')
                     )
+                    if hasattr(self.coordinator, "state") and self.coordinator.state:
+                        self.coordinator.state.sync_position_snapshot(
+                            position=Decimal('0'),
+                            average_cost=Decimal('0'),
+                        )
                     self._last_position_size = Decimal('0')
                     self._last_position_price = Decimal('0')
 
@@ -211,6 +216,11 @@ class PositionMonitor:
             )
 
             # 检测持仓变化
+            if hasattr(self.coordinator, "state") and self.coordinator.state:
+                self.coordinator.state.sync_position_snapshot(
+                    position=position_qty,
+                    average_cost=entry_price,
+                )
             position_changed = (position_qty != self._last_position_size)
 
             # 更新剥头皮管理器（如果持仓变化）

@@ -355,7 +355,10 @@ class GridCoordinator:
 
             # 🔥 成交去重：防止同一笔成交被 REST 轮询和健康检查同步重复处理
             import time as _time
-            fill_key = f"{filled_order.grid_id}:{filled_order.side.value}:{filled_order.price}"
+            fill_key = (
+                f"{filled_order.order_id}:{filled_order.side.value}:"
+                f"{filled_order.price}:{filled_order.filled_amount or filled_order.amount}"
+            )
             current_time = _time.time()
             # 清理过期条目
             self._recent_fills = {

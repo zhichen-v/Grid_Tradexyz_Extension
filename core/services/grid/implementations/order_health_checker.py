@@ -255,16 +255,18 @@ class OrderHealthChecker:
         return cleaned
 
     def _find_duplicate_orders(self, exchange_orders: List[OrderData]) -> List[OrderData]:
-        """Return duplicate orders after grouping by grid id and side."""
-        seen: Dict[Tuple[int, str], OrderData] = {}
+        """Return duplicate orders after grouping by exact price and side."""
+        seen: Dict[Tuple[str, str], OrderData] = {}
         duplicates: List[OrderData] = []
 
         for order in exchange_orders:
-            grid_id = self._grid_id_from_price(order.price)
-            if grid_id is None:
+            if getattr(order, "price", None) is None:
                 continue
 
-            key = (grid_id, order.side.value.lower())
+            key = (
+                self._normalize_price_key(order.price),
+                order.side.value.lower(),
+            )
             if key in seen:
                 duplicates.append(order)
             else:
@@ -280,18 +282,27 @@ class OrderHealthChecker:
         """Build missing orders from tracked orders plus the live base-side ladder."""
         expected_orders = self._get_expected_open_orders()
         existing_keys = {
-            (self._grid_id_from_price(order.price), order.side.value.lower())
+            (self._normalize_price_key(order.price), order.side.value.lower())
             for order in exchange_orders
-            if self._grid_id_from_price(order.price) is not None
+            if getattr(order, "price", None) is not None
         }
-        existing_keys.update(self._get_local_open_order_keys())
-        existing_grid_ids = {grid_id for grid_id, _side in existing_keys if grid_id is not None}
+        existing_keys.update(self._get_local_open_order_price_keys())
+        existing_grid_ids = {
+            grid_id
+            for order in exchange_orders
+            for grid_id in [self._grid_id_from_price(order.price)]
+            if grid_id is not None
+        }
+        existing_grid_ids.update(self._get_local_open_grid_ids())
 
         missing: List[GridOrder] = []
-        missing_keys: set[Tuple[int, str]] = set()
+        missing_keys: set[Tuple[str, str]] = set()
 
         for expected in expected_orders:
-            key = (expected.grid_id, expected.side.value.lower())
+            key = (
+                self._normalize_price_key(expected.price),
+                expected.side.value.lower(),
+            )
             if key in existing_keys:
                 continue
             if key in missing_keys:
@@ -316,7 +327,10 @@ class OrderHealthChecker:
             existing_keys=existing_keys,
         )
         for expected in supplemental_orders:
-            key = (expected.grid_id, expected.side.value.lower())
+            key = (
+                self._normalize_price_key(expected.price),
+                expected.side.value.lower(),
+            )
             if key in missing_keys:
                 continue
             missing.append(expected)
@@ -340,7 +354,7 @@ class OrderHealthChecker:
         self,
         current_price: Decimal,
         existing_grid_ids: set[int],
-        existing_keys: set[Tuple[int, str]],
+        existing_keys: set[Tuple[str, str]],
     ) -> List[GridOrder]:
         """Infer missing base-side maker orders from the current price and grid range."""
         base_side = self._base_side_for_grid_type()
@@ -357,7 +371,10 @@ class OrderHealthChecker:
             if self._is_grid_locked(grid_id):
                 continue
 
-            key = (grid_id, base_side.value.lower())
+            key = (
+                self._normalize_price_key(price),
+                base_side.value.lower(),
+            )
             if key in existing_keys:
                 continue
 
@@ -417,6 +434,31 @@ class OrderHealthChecker:
             keys.add((order.grid_id, order.side.value.lower()))
 
         return keys
+
+    def _get_local_open_order_price_keys(self) -> set[Tuple[str, str]]:
+        """Return tracked local pending orders grouped by normalized price and side."""
+        keys = self._get_state_open_order_price_keys()
+        keys.update(self._get_engine_open_order_price_keys())
+        return keys
+
+    def _get_local_open_grid_ids(self) -> set[int]:
+        """Return tracked local pending orders grouped by grid id for base-grid repair checks."""
+        grid_ids: set[int] = set()
+
+        coordinator = getattr(self.engine, "coordinator", None)
+        state = getattr(coordinator, "state", None) if coordinator else None
+        if state and getattr(state, "active_orders", None):
+            for order in state.active_orders.values():
+                if getattr(order, "status", None) != GridOrderStatus.PENDING:
+                    continue
+                grid_ids.add(order.grid_id)
+
+        for order in self.engine.get_pending_orders():
+            if getattr(order, "status", None) != GridOrderStatus.PENDING:
+                continue
+            grid_ids.add(order.grid_id)
+
+        return grid_ids
 
     def _get_state_open_order_keys(self) -> set[Tuple[int, str]]:
         """Return coordinator-state pending orders grouped by grid id and side."""

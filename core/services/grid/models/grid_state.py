@@ -295,6 +295,12 @@ class GridState:
         """是否运行中"""
         return self.status == GridStatus.RUNNING
     
+    def sync_position_snapshot(self, position: Decimal, average_cost: Decimal):
+        """Sync the state position snapshot from the latest exchange position data."""
+        self.current_position = position
+        self.average_cost = average_cost
+        self.last_update_at = datetime.now()
+
     def __repr__(self) -> str:
         return (
             f"GridState(status={self.status.value}, "

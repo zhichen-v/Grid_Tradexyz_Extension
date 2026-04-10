@@ -968,7 +968,16 @@ class GridEngineImpl(IGridEngine):
             return False
 
         status = str(item.get("status") or item.get("state") or item.get("X") or "").lower()
-        if fill_on_user_fill or status in {"filled", "closed"}:
+        if fill_on_user_fill:
+            return await self._handle_tradexyz_user_fill(
+                grid_order,
+                item,
+                source,
+                cache_key,
+                order_id,
+            )
+
+        if status in {"filled", "closed"}:
             filled_price = self._safe_decimal(
                 item.get("px")
                 or item.get("avgPx")
@@ -1003,6 +1012,90 @@ class GridEngineImpl(IGridEngine):
             return True
 
         return False
+
+    async def _handle_tradexyz_user_fill(
+        self,
+        grid_order: GridOrder,
+        item: Dict[str, Any],
+        source: str,
+        *keys: Optional[str],
+    ) -> bool:
+        """Accumulate TradeXYZ user fills and finalize only once the full grid order is filled."""
+        filled_price = self._safe_decimal(
+            item.get("px")
+            or item.get("avgPx")
+            or item.get("price")
+            or item.get("p"),
+            grid_order.price,
+        )
+        fill_amount = self._safe_decimal(
+            item.get("sz")
+            or item.get("filledSz")
+            or item.get("filled")
+            or item.get("z"),
+            Decimal("0"),
+        )
+        if fill_amount <= 0:
+            return False
+
+        tracking = self._get_tradexyz_fill_tracking(grid_order)
+        event_key = self._build_tradexyz_fill_event_key(
+            item,
+            grid_order,
+            filled_price,
+            fill_amount,
+        )
+        seen_event_keys = tracking.setdefault("seen_event_keys", [])
+        if event_key in seen_event_keys:
+            self.logger.debug(
+                f"Skipping duplicate TradeXYZ user fill: "
+                f"grid_id={grid_order.grid_id}, order_id={grid_order.order_id}, event={event_key}"
+            )
+            return True
+
+        seen_event_keys.append(event_key)
+        if len(seen_event_keys) > 20:
+            del seen_event_keys[:-20]
+
+        cumulative_filled = self._safe_decimal(
+            tracking.get("cumulative_filled"),
+            Decimal("0"),
+        ) + fill_amount
+        order_amount = grid_order.amount or Decimal("0")
+        tolerance = self._get_order_fill_tolerance()
+
+        if order_amount > 0 and cumulative_filled > order_amount:
+            overflow = cumulative_filled - order_amount
+            if overflow > tolerance:
+                self.logger.warning(
+                    f"TradeXYZ user fill overflow detected: "
+                    f"grid_id={grid_order.grid_id}, order_id={grid_order.order_id}, "
+                    f"cumulative={cumulative_filled}, order_amount={order_amount}"
+                )
+            cumulative_filled = order_amount
+
+        tracking["cumulative_filled"] = str(cumulative_filled)
+        tracking["remaining_amount"] = str(max(order_amount - cumulative_filled, Decimal("0")))
+        tracking["last_fill_price"] = str(filled_price)
+
+        if order_amount > 0 and (order_amount - cumulative_filled) > tolerance:
+            self.logger.info(
+                f"{source} partial fill recorded: "
+                f"grid_id={grid_order.grid_id}, side={grid_order.side.value}, "
+                f"incremental={fill_amount}, cumulative={cumulative_filled}, "
+                f"remaining={order_amount - cumulative_filled}, order_id={grid_order.order_id}"
+            )
+            return True
+
+        final_amount = order_amount if order_amount > 0 else cumulative_filled
+        await self._finalize_fill(
+            grid_order,
+            filled_price,
+            final_amount,
+            f"{source} final fill received",
+            *keys,
+        )
+        return True
 
     async def _handle_binance_style_update(self, data: Dict[str, Any]):
         """Handle updates that use Binance-style fields such as X, i, p, and z."""
@@ -1298,6 +1391,45 @@ class GridEngineImpl(IGridEngine):
         price_token = int(order.price or 0)
         return f"grid_{order.grid_id}_{price_token}_{amount_token}"
 
+    def _get_tradexyz_fill_tracking(self, grid_order: GridOrder) -> Dict[str, Any]:
+        """Return mutable TradeXYZ user-fill tracking data for one pending order."""
+        if not isinstance(grid_order.exchange_data, dict):
+            grid_order.exchange_data = {}
+
+        tracking = grid_order.exchange_data.get("tradexyz_fill_tracking")
+        if not isinstance(tracking, dict):
+            tracking = {}
+            grid_order.exchange_data["tradexyz_fill_tracking"] = tracking
+        return tracking
+
+    def _build_tradexyz_fill_event_key(
+        self,
+        item: Dict[str, Any],
+        grid_order: GridOrder,
+        filled_price: Decimal,
+        fill_amount: Decimal,
+    ) -> str:
+        """Build a stable key so duplicate TradeXYZ user-fill events are ignored."""
+        explicit_id = (
+            item.get("tid")
+            or item.get("fillId")
+            or item.get("fill_id")
+            or item.get("tradeId")
+            or item.get("hash")
+            or item.get("txHash")
+        )
+        if explicit_id is not None:
+            return str(explicit_id)
+
+        event_time = item.get("time") or item.get("timestamp") or ""
+        side = item.get("side") or grid_order.side.value
+        normalized_price = format(filled_price.normalize(), "f")
+        normalized_amount = format(fill_amount.normalize(), "f")
+        return (
+            f"{grid_order.order_id}:{event_time}:{side}:"
+            f"{normalized_price}:{normalized_amount}"
+        )
+
     def _string_or_none(self, value: Any) -> Optional[str]:
         """Normalize a value into a non-empty string key."""
         if value is None:
@@ -1313,6 +1445,18 @@ class GridEngineImpl(IGridEngine):
             return Decimal(str(value))
         except Exception:
             return default
+
+    def _get_order_fill_tolerance(self) -> Decimal:
+        """Return the fill-total tolerance derived from configured quantity precision."""
+        precision = getattr(self.config, "quantity_precision", None)
+        if precision is None:
+            return Decimal("0.00000001")
+
+        try:
+            quantizer = Decimal("0.1") ** int(precision)
+        except Exception:
+            return Decimal("0.00000001")
+        return quantizer / Decimal("2")
 
     def _to_timestamp(self, value: Any) -> float:
         """Convert datetime-like heartbeat values into unix timestamps."""
