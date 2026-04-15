@@ -31,8 +31,8 @@ This project is expected to run inside `.venv`, and the default workflow uses `u
 ## 3. Clone the Repository
 
 ```bash
-git clone <your-repo-url>
-cd grid1.3
+git clone https://github.com/zhichen-v/Grid_Tradexyz_Extension.git
+cd Grid_Tradexyz_Extension
 ```
 
 If you downloaded the source as a zip, unpack it first and then enter the project directory.
