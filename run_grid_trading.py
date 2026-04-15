@@ -1,223 +1,230 @@
 #!/usr/bin/env python3
 """
-网格交易系统启动脚本
+Grid trading system startup script.
 
-独立启动网格交易系统
+Use this entrypoint to start the grid trading runtime directly.
 """
 
+import argparse
+import asyncio
+import logging
+import sys
+from decimal import Decimal
+from pathlib import Path
+
+import yaml
+
+from core.adapters.exchanges import ExchangeConfig, ExchangeFactory
 from core.adapters.exchanges.models import ExchangeType
-from core.adapters.exchanges import ExchangeFactory, ExchangeConfig
-from core.services.grid.terminal_ui import GridTerminalUI
+from core.logging import get_system_logger
 from core.services.grid.coordinator import GridCoordinator
 from core.services.grid.implementations import (
-    GridStrategyImpl,
     GridEngineImpl,
-    PositionTrackerImpl
+    GridStrategyImpl,
+    PositionTrackerImpl,
 )
-from core.services.grid.models import GridConfig, GridType, GridState
+from core.services.grid.models import GridConfig, GridState, GridType
 from core.services.grid.reserve import (
-    SpotReserveManager,
     ReserveMonitor,
-    check_spot_reserve_on_startup
+    SpotReserveManager,
+    check_spot_reserve_on_startup,
 )
-from core.logging import get_system_logger
-import sys
-import asyncio
-import yaml
-from pathlib import Path
-from decimal import Decimal
-import argparse
-import logging
+from core.services.grid.terminal_ui import GridTerminalUI
 
-# 添加项目根目录到路径
+
+# Add the project root to the import path.
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 
-# 导入交易所适配器
-
-
 async def load_config(config_path: str) -> dict:
     """
-    加载配置文件
+    Load a YAML configuration file.
 
     Args:
-        config_path: 配置文件路径
+        config_path: Configuration file path.
 
     Returns:
-        配置字典
+        Parsed configuration dictionary.
     """
     try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
+        with open(config_path, "r", encoding="utf-8") as file:
+            config = yaml.safe_load(file)
         return config
-    except Exception as e:
-        print(f"❌ 加载配置文件失败: {e}")
+    except Exception as exc:
+        print(f"Failed to load config file: {exc}")
         raise
 
 
 def create_grid_config(config_data: dict) -> GridConfig:
     """
-    创建网格配置对象
+    Build the grid configuration object from raw config data.
 
     Args:
-        config_data: 配置数据
+        config_data: Parsed configuration data.
 
     Returns:
-        网格配置对象
+        Grid configuration object.
     """
-    grid_config = config_data['grid_system']
-    grid_type = GridType(grid_config['grid_type'])
+    grid_config = config_data["grid_system"]
+    grid_type = GridType(grid_config["grid_type"])
 
-    # 基础参数
+    # Base parameters.
     params = {
-        'exchange': grid_config['exchange'],
-        'symbol': grid_config['symbol'],
-        'grid_type': grid_type,
-        'grid_interval': Decimal(str(grid_config['grid_interval'])),
-        'order_amount': Decimal(str(grid_config['order_amount'])),
-        'max_position': Decimal(str(grid_config.get('max_position'))) if grid_config.get('max_position') else None,
-        'enable_notifications': grid_config.get('enable_notifications', False),
-        'order_health_check_interval': grid_config.get('order_health_check_interval', 600),
-        # 默认万分之1
-        'fee_rate': Decimal(str(grid_config.get('fee_rate', '0.0001'))),
-        # 🔥 数量精度参数（重要！不同代币精度不同）
-        'quantity_precision': int(grid_config.get('quantity_precision', 3)),
+        "exchange": grid_config["exchange"],
+        "symbol": grid_config["symbol"],
+        "grid_type": grid_type,
+        "grid_interval": Decimal(str(grid_config["grid_interval"])),
+        "order_amount": Decimal(str(grid_config["order_amount"])),
+        "max_position": (
+            Decimal(str(grid_config.get("max_position")))
+            if grid_config.get("max_position")
+            else None
+        ),
+        "enable_notifications": grid_config.get("enable_notifications", False),
+        "order_health_check_interval": grid_config.get(
+            "order_health_check_interval", 600
+        ),
+        "fee_rate": Decimal(str(grid_config.get("fee_rate", "0.0001"))),
+        "quantity_precision": int(grid_config.get("quantity_precision", 3)),
     }
 
-    # 🔥 价格移动网格：使用 follow_grid_count
+    # Follow grid settings.
     if grid_type in [GridType.FOLLOW_LONG, GridType.FOLLOW_SHORT]:
-        params['follow_grid_count'] = grid_config['follow_grid_count']
-        params['follow_timeout'] = grid_config.get('follow_timeout', 300)
-        params['follow_distance'] = grid_config.get('follow_distance', 1)
-        params['price_offset_grids'] = grid_config.get(
-            'price_offset_grids', 0)  # 🆕 价格偏移网格数
-        # lower_price 和 upper_price 保持默认值 None
+        params["follow_grid_count"] = grid_config["follow_grid_count"]
+        params["follow_timeout"] = grid_config.get("follow_timeout", 300)
+        params["follow_distance"] = grid_config.get("follow_distance", 1)
+        params["price_offset_grids"] = grid_config.get("price_offset_grids", 0)
+        # lower_price and upper_price stay at their default None values.
     else:
-        # 普通网格和马丁网格：读取 lower_price / upper_price
-        # 支援扁平格式（直接在 grid_system 下）或巢状格式（price_range 子层）
-        if 'price_range' in grid_config:
-            params['lower_price'] = Decimal(
-                str(grid_config['price_range']['lower_price']))
-            params['upper_price'] = Decimal(
-                str(grid_config['price_range']['upper_price']))
+        # Support both flat and nested price range config formats.
+        if "price_range" in grid_config:
+            params["lower_price"] = Decimal(
+                str(grid_config["price_range"]["lower_price"])
+            )
+            params["upper_price"] = Decimal(
+                str(grid_config["price_range"]["upper_price"])
+            )
         else:
-            params['lower_price'] = Decimal(
-                str(grid_config['lower_price']))
-            params['upper_price'] = Decimal(
-                str(grid_config['upper_price']))
+            params["lower_price"] = Decimal(str(grid_config["lower_price"]))
+            params["upper_price"] = Decimal(str(grid_config["upper_price"]))
 
-    # 🔥 马丁网格：添加 martingale_increment
-    if 'martingale_increment' in grid_config:
-        params['martingale_increment'] = Decimal(
-            str(grid_config['martingale_increment']))
+    # Martingale settings.
+    if "martingale_increment" in grid_config:
+        params["martingale_increment"] = Decimal(
+            str(grid_config["martingale_increment"])
+        )
 
-    # 🔥 剥头皮模式：添加剥头皮参数
-    if 'scalping_enabled' in grid_config:
-        params['scalping_enabled'] = grid_config['scalping_enabled']
-    if 'scalping_trigger_percent' in grid_config:
-        params['scalping_trigger_percent'] = grid_config['scalping_trigger_percent']
-    if 'scalping_take_profit_grids' in grid_config:
-        params['scalping_take_profit_grids'] = grid_config['scalping_take_profit_grids']
+    # Scalping settings.
+    if "scalping_enabled" in grid_config:
+        params["scalping_enabled"] = grid_config["scalping_enabled"]
+    if "scalping_trigger_percent" in grid_config:
+        params["scalping_trigger_percent"] = grid_config["scalping_trigger_percent"]
+    if "scalping_take_profit_grids" in grid_config:
+        params["scalping_take_profit_grids"] = grid_config[
+            "scalping_take_profit_grids"
+        ]
 
-    # 🛡️ 本金保护模式：添加本金保护参数
-    if 'capital_protection_enabled' in grid_config:
-        params['capital_protection_enabled'] = grid_config['capital_protection_enabled']
-    if 'capital_protection_trigger_percent' in grid_config:
-        params['capital_protection_trigger_percent'] = grid_config['capital_protection_trigger_percent']
+    # Capital protection settings.
+    if "capital_protection_enabled" in grid_config:
+        params["capital_protection_enabled"] = grid_config[
+            "capital_protection_enabled"
+        ]
+    if "capital_protection_trigger_percent" in grid_config:
+        params["capital_protection_trigger_percent"] = grid_config[
+            "capital_protection_trigger_percent"
+        ]
 
-    # 💰 止盈模式：添加止盈参数
-    if 'take_profit_enabled' in grid_config:
-        params['take_profit_enabled'] = grid_config['take_profit_enabled']
-    if 'take_profit_percentage' in grid_config:
-        params['take_profit_percentage'] = Decimal(
-            str(grid_config['take_profit_percentage']))
+    # Take-profit settings.
+    if "take_profit_enabled" in grid_config:
+        params["take_profit_enabled"] = grid_config["take_profit_enabled"]
+    if "take_profit_percentage" in grid_config:
+        params["take_profit_percentage"] = Decimal(
+            str(grid_config["take_profit_percentage"])
+        )
 
-    # 🔒 价格锁定模式：添加价格锁定参数
-    if 'price_lock_enabled' in grid_config:
-        params['price_lock_enabled'] = grid_config['price_lock_enabled']
-    if 'price_lock_threshold' in grid_config:
-        params['price_lock_threshold'] = Decimal(
-            str(grid_config['price_lock_threshold']))
-    if 'price_lock_start_at_threshold' in grid_config:
-        params['price_lock_start_at_threshold'] = grid_config['price_lock_start_at_threshold']
+    # Price-lock settings.
+    if "price_lock_enabled" in grid_config:
+        params["price_lock_enabled"] = grid_config["price_lock_enabled"]
+    if "price_lock_threshold" in grid_config:
+        params["price_lock_threshold"] = Decimal(
+            str(grid_config["price_lock_threshold"])
+        )
+    if "price_lock_start_at_threshold" in grid_config:
+        params["price_lock_start_at_threshold"] = grid_config[
+            "price_lock_start_at_threshold"
+        ]
 
-    # 🎯 反手挂单参数：添加反手挂单格子距离参数
-    if 'reverse_order_grid_distance' in grid_config:
-        params['reverse_order_grid_distance'] = int(
-            grid_config['reverse_order_grid_distance'])
+    # Reverse-order settings.
+    if "reverse_order_grid_distance" in grid_config:
+        params["reverse_order_grid_distance"] = int(
+            grid_config["reverse_order_grid_distance"]
+        )
 
-    # 🔥 现货预留管理配置（仅现货需要）
-    if 'spot_reserve' in grid_config:
-        params['spot_reserve'] = grid_config['spot_reserve']
+    # Spot reserve settings.
+    if "spot_reserve" in grid_config:
+        params["spot_reserve"] = grid_config["spot_reserve"]
 
-    # 🔥 健康检查容错配置
-    if 'position_tolerance' in grid_config:
-        params['position_tolerance'] = grid_config['position_tolerance']
+    # Health-check tolerance settings.
+    if "position_tolerance" in grid_config:
+        params["position_tolerance"] = grid_config["position_tolerance"]
 
     return GridConfig(**params)
 
 
 def detect_market_type(symbol: str, exchange_name: str) -> ExchangeType:
     """
-    根据交易对符号自动检测市场类型
+    Detect the market type from the trading symbol and exchange.
 
     Args:
-        symbol: 交易对符号
-        exchange_name: 交易所名称
+        symbol: Trading pair symbol.
+        exchange_name: Exchange name.
 
     Returns:
-        ExchangeType: 市场类型（现货或永续合约）
+        ExchangeType: Spot or perpetual market type.
     """
     symbol_upper = symbol.upper()
     exchange_lower = exchange_name.lower()
 
-    # Hyperliquid 交易所
+    # Hyperliquid exchange.
     if exchange_lower == "hyperliquid":
-        # Hyperliquid符号格式：
-        # - 现货: BTC/USDC (没有后缀)
-        # - 永续: BTC/USDC:USDC (后缀:USDC)
+        # Hyperliquid symbol formats:
+        # - Spot: BTC/USDC
+        # - Perpetual: BTC/USDC:USDC
         if ":USDC" in symbol_upper or ":PERP" in symbol_upper or ":SPOT" in symbol_upper:
-            # 有后缀的情况
             if ":SPOT" in symbol_upper:
                 return ExchangeType.SPOT
-            else:
-                return ExchangeType.PERPETUAL
-        else:
-            # 🔥 没有后缀 → 现货（Hyperliquid的现货格式）
-            return ExchangeType.SPOT
+            return ExchangeType.PERPETUAL
+        return ExchangeType.SPOT
 
-    # Backpack 交易所
-    elif exchange_lower == "backpack":
+    # Backpack exchange.
+    if exchange_lower == "backpack":
         if "_PERP" in symbol_upper or "PERP" in symbol_upper:
             return ExchangeType.PERPETUAL
-        elif "_SPOT" in symbol_upper or "SPOT" in symbol_upper:
+        if "_SPOT" in symbol_upper or "SPOT" in symbol_upper:
             return ExchangeType.SPOT
-        else:
-            # 默认为永续合约
-            return ExchangeType.PERPETUAL
-
-    # Lighter 交易所
-    elif exchange_lower == "lighter":
-        # Lighter是永续合约交易所，所有交易对都是永续合约
-        # 符号格式：BTC-USD, ETH-USD, SOL-USD等
         return ExchangeType.PERPETUAL
 
-    # TradeXYZ 交易所
-    elif exchange_lower == "tradexyz":
+    # Lighter exchange.
+    if exchange_lower == "lighter":
         return ExchangeType.PERPETUAL
 
-    # 其他交易所默认为永续合约
-    else:
+    # TradeXYZ exchange.
+    if exchange_lower == "tradexyz":
         return ExchangeType.PERPETUAL
 
+    # Default for unknown exchanges.
+    return ExchangeType.PERPETUAL
 
-def _load_dotenv():
-    """从 .env 文件加载环境变量（不覆盖已有值）"""
+
+def _load_dotenv() -> None:
+    """Load environment variables from `.env` without overwriting existing values."""
     import os
+
     env_path = Path(".env")
     if not env_path.exists():
         return
+
     for line in env_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
@@ -227,136 +234,137 @@ def _load_dotenv():
 
 async def create_exchange_adapter(config_data: dict):
     """
-    创建交易所适配器
+    Create and connect the exchange adapter.
 
     Args:
-        config_data: 配置数据
+        config_data: Parsed configuration data.
 
     Returns:
-        交易所适配器
+        Connected exchange adapter.
     """
     import os
 
-    grid_config = config_data['grid_system']
-    exchange_name = grid_config['exchange'].lower()
-    symbol = grid_config['symbol']
+    grid_config = config_data["grid_system"]
+    exchange_name = grid_config["exchange"].lower()
+    symbol = grid_config["symbol"]
 
-    # 🔥 加载 .env 文件（Agent Wallet 密钥等）
+    # Load additional credentials from .env, such as agent wallet keys.
     _load_dotenv()
 
-    # 🔥 自动检测市场类型（现货 vs 永续合约）
+    # Detect spot vs perpetual automatically.
     market_type = detect_market_type(symbol, exchange_name)
+    print(f"   - Market type: {market_type.value}")
 
-    print(f"   - 市场类型: {market_type.value}")
-
-    # 优先级：环境变量 > 交易所配置文件 > 空字符串
+    # Resolution order: environment variables > exchange config file > empty string.
     api_key = os.getenv(f"{exchange_name.upper()}_API_KEY")
     api_secret = os.getenv(f"{exchange_name.upper()}_API_SECRET")
-    wallet_address = os.getenv(
-        f"{exchange_name.upper()}_WALLET_ADDRESS")  # 用于 Hyperliquid / TradeXYZ
+    wallet_address = os.getenv(f"{exchange_name.upper()}_WALLET_ADDRESS")
 
     if exchange_name in {"hyperliquid", "tradexyz"}:
         api_key = api_key or api_secret
         api_secret = api_secret or api_key
 
-    # 🔥 TradeXYZ 额外支持 HL_AGENT_KEY / HL_WALLET_ADDRESS（Agent Wallet）
+    # TradeXYZ additionally supports HL_AGENT_KEY / HL_WALLET_ADDRESS.
     if exchange_name == "tradexyz":
         hl_agent_key = os.getenv("HL_AGENT_KEY")
         hl_wallet_address = os.getenv("HL_WALLET_ADDRESS")
         if hl_agent_key and not api_key:
             api_key = hl_agent_key
             api_secret = hl_agent_key
-            print("   ✓ 使用 HL_AGENT_KEY (Agent Wallet)")
+            print("   - Using HL_AGENT_KEY (Agent Wallet)")
         if hl_wallet_address and not wallet_address:
             wallet_address = hl_wallet_address
 
-    # 如果环境变量没有设置，尝试从交易所配置文件读取
+    # Fall back to the exchange config file if env vars are not set.
     if not api_key or not api_secret:
         try:
             exchange_config_path = Path(
-                f"config/exchanges/{exchange_name}_config.yaml")
+                f"config/exchanges/{exchange_name}_config.yaml"
+            )
             if exchange_config_path.exists():
-                with open(exchange_config_path, 'r', encoding='utf-8') as f:
-                    exchange_config_data = yaml.safe_load(f)
+                with open(exchange_config_path, "r", encoding="utf-8") as file:
+                    exchange_config_data = yaml.safe_load(file)
 
-                auth_config = exchange_config_data.get(
-                    exchange_name, {}).get('authentication', {})
+                auth_config = exchange_config_data.get(exchange_name, {}).get(
+                    "authentication", {}
+                )
 
-                # 🔥 修复：不同交易所使用不同的认证方式
                 if exchange_name in {"hyperliquid", "tradexyz"}:
-                    # Hyperliquid / TradeXYZ 使用 private_key 作为主密钥
-                    api_key = api_key or auth_config.get('private_key', "")
-                    api_secret = api_secret or auth_config.get(
-                        'private_key', "")  # 同一个密钥
+                    api_key = api_key or auth_config.get("private_key", "")
+                    api_secret = api_secret or auth_config.get("private_key", "")
                     wallet_address = wallet_address or auth_config.get(
-                        'wallet_address', "")
+                        "wallet_address", ""
+                    )
                 elif exchange_name == "lighter":
-                    # Lighter 使用 API Key私钥和账户索引
-                    api_config = exchange_config_data.get('api_config', {})
-                    auth_config = api_config.get('auth', {})
-                    api_key = api_key or auth_config.get(
-                        'api_key_private_key', "")
+                    api_config = exchange_config_data.get("api_config", {})
+                    auth_config = api_config.get("auth", {})
+                    api_key = api_key or auth_config.get("api_key_private_key", "")
                     api_secret = api_secret or auth_config.get(
-                        'api_key_private_key', "")
-                    # Lighter特殊配置将在创建适配器时单独处理
+                        "api_key_private_key", ""
+                    )
                 else:
-                    # 其他交易所使用标准的 api_key/api_secret
-                    api_key = api_key or auth_config.get('api_key', "")
+                    api_key = api_key or auth_config.get("api_key", "")
                     api_secret = api_secret or auth_config.get(
-                        'private_key', "") or auth_config.get('api_secret', "")
+                        "private_key", ""
+                    ) or auth_config.get("api_secret", "")
                     wallet_address = wallet_address or auth_config.get(
-                        'wallet_address', "")
+                        "wallet_address", ""
+                    )
 
                 if api_key and api_secret:
-                    print(f"   ✓ 从配置文件读取API密钥: {exchange_config_path}")
-                    if exchange_name in {"hyperliquid", "tradexyz"} and wallet_address:
+                    print(f"   - Loaded API credentials from: {exchange_config_path}")
+                    if (
+                        exchange_name in {"hyperliquid", "tradexyz"}
+                        and wallet_address
+                    ):
                         print(
-                            f"   ✓ 钱包地址: {wallet_address[:10]}...{wallet_address[-6:]}")
-        except Exception as e:
-            print(f"   ⚠️  无法读取交易所配置文件: {e}")
+                            f"   - Wallet address: {wallet_address[:10]}...{wallet_address[-6:]}"
+                        )
+        except Exception as exc:
+            print(f"   - Warning: failed to read exchange config file: {exc}")
 
-    # 如果仍然没有密钥，给出警告
+    # Print a warning if credentials are still missing.
     if not api_key or not api_secret:
-        print(f"   ⚠️  警告：未找到API密钥配置")
+        print("   - Warning: API credentials were not found")
         print(
-            f"   提示：请设置环境变量或在 config/exchanges/{exchange_name}_config.yaml 中配置")
+            f"   - Hint: set environment variables or configure config/exchanges/{exchange_name}_config.yaml"
+        )
 
-        # 🔥 交易所特殊配置提示
         if exchange_name in {"hyperliquid", "tradexyz"}:
             display_name = "Hyperliquid" if exchange_name == "hyperliquid" else "TradeXYZ"
-            print(f"   💡 {display_name} 需要配置:")
-            print(f"      - private_key: 钱包私钥")
-            print(f"      - wallet_address: 钱包地址")
+            print(f"   - {display_name} requires:")
+            print("      - private_key: wallet private key")
+            print("      - wallet_address: wallet address")
         elif exchange_name == "lighter":
-            print(f"   💡 Lighter 需要配置:")
-            print(f"      - api_key_private_key: API Key私钥")
-            print(f"      - account_index: 账户索引")
-            print(f"      - api_key_index: API Key索引（默认0）")
+            print("   - Lighter requires:")
+            print("      - api_key_private_key: API key private key")
+            print("      - account_index: account index")
+            print("      - api_key_index: API key index (default 0)")
 
-    # 创建交易所配置
+    # Build the exchange configuration.
     if exchange_name == "lighter":
-        # Lighter需要特殊的配置方式
         try:
             lighter_config_path = Path("config/exchanges/lighter_config.yaml")
             if lighter_config_path.exists():
-                with open(lighter_config_path, 'r', encoding='utf-8') as f:
-                    lighter_config_data = yaml.safe_load(f)
-                api_config = lighter_config_data.get('api_config', {})
-                auth_config = api_config.get('auth', {})
+                with open(lighter_config_path, "r", encoding="utf-8") as file:
+                    lighter_config_data = yaml.safe_load(file)
+                api_config = lighter_config_data.get("api_config", {})
 
                 exchange_config = ExchangeConfig(
                     exchange_id="lighter",
                     name="Lighter",
                     exchange_type=market_type,
-                    api_key="",  # Lighter适配器内部从配置文件读取
-                    api_secret="",  # Lighter适配器内部从配置文件读取
-                    testnet=api_config.get('testnet', False),
+                    api_key="",
+                    api_secret="",
+                    testnet=api_config.get("testnet", False),
                     enable_websocket=True,
-                    enable_auto_reconnect=True
+                    enable_auto_reconnect=True,
                 )
-                print(f"   ✓ Lighter配置加载成功（适配器将自动读取API密钥）")
+                print(
+                    "   - Lighter config loaded successfully (adapter will read API credentials automatically)"
+                )
             else:
-                print(f"   ⚠️  未找到Lighter配置文件: {lighter_config_path}")
+                print(f"   - Warning: Lighter config file not found: {lighter_config_path}")
                 exchange_config = ExchangeConfig(
                     exchange_id="lighter",
                     name="Lighter",
@@ -365,10 +373,10 @@ async def create_exchange_adapter(config_data: dict):
                     api_secret="",
                     testnet=False,
                     enable_websocket=True,
-                    enable_auto_reconnect=True
+                    enable_auto_reconnect=True,
                 )
-        except Exception as e:
-            print(f"   ⚠️  加载Lighter配置失败: {e}")
+        except Exception as exc:
+            print(f"   - Warning: failed to load Lighter config: {exc}")
             exchange_config = ExchangeConfig(
                 exchange_id="lighter",
                 name="Lighter",
@@ -377,335 +385,324 @@ async def create_exchange_adapter(config_data: dict):
                 api_secret="",
                 testnet=False,
                 enable_websocket=True,
-                enable_auto_reconnect=True
+                enable_auto_reconnect=True,
             )
     else:
-        # 其他交易所使用标准配置
         display_name = "TradeXYZ" if exchange_name == "tradexyz" else exchange_name.capitalize()
         exchange_config = ExchangeConfig(
             exchange_id=exchange_name,
             name=display_name,
-            exchange_type=market_type,  # 🔥 使用自动检测的市场类型
+            exchange_type=market_type,
             api_key=api_key or "",
             api_secret=api_secret or "",
-            wallet_address=wallet_address,  # Hyperliquid / TradeXYZ 需要
+            wallet_address=wallet_address,
             testnet=False,
             enable_websocket=True,
-            enable_auto_reconnect=True
+            enable_auto_reconnect=True,
         )
 
-    # 使用工厂创建适配器
+    # Create and connect the adapter through the factory.
     factory = ExchangeFactory()
-    adapter = factory.create_adapter(
-        exchange_id=exchange_name,
-        config=exchange_config
-    )
-
-    # 连接交易所
+    adapter = factory.create_adapter(exchange_id=exchange_name, config=exchange_config)
     await adapter.connect()
-
     return adapter
 
 
-async def main(config_path: str = "config/grid/default_grid.yaml", debug: bool = False):
+async def main(
+    config_path: str = "config/grid/default_grid.yaml", debug: bool = False
+) -> None:
     """
-    主函数
+    Main entrypoint.
 
     Args:
-        config_path: 配置文件路径
-        debug: 是否启用DEBUG模式
+        config_path: Configuration file path.
+        debug: Whether to enable debug mode.
     """
-    # 🔥 如果启用 DEBUG 模式，设置日志级别
     if debug:
-        # 设置根日志级别为 DEBUG
         logging.getLogger().setLevel(logging.DEBUG)
 
-        # 设置核心模块的日志级别为 DEBUG
-        for module in ['core.services.grid', 'core.adapters.exchanges', 'ExchangeAdapter']:
+        for module in ["core.services.grid", "core.adapters.exchanges", "ExchangeAdapter"]:
             logging.getLogger(module).setLevel(logging.DEBUG)
 
-        # 🔥 为 lighter_websocket 添加文件handler，确保调试日志能写入文件
         lighter_ws_logger = logging.getLogger(
-            'core.adapters.exchanges.adapters.lighter_websocket')
+            "core.adapters.exchanges.adapters.lighter_websocket"
+        )
         lighter_ws_logger.setLevel(logging.DEBUG)
 
-        # 添加文件handler到 ExchangeAdapter.log
         from logging.handlers import RotatingFileHandler
+
         ws_handler = RotatingFileHandler(
-            'logs/ExchangeAdapter.log',
-            maxBytes=10*1024*1024,  # 10MB
+            "logs/ExchangeAdapter.log",
+            maxBytes=10 * 1024 * 1024,
             backupCount=3,
-            encoding='utf-8'
+            encoding="utf-8",
         )
         ws_handler.setLevel(logging.DEBUG)
         ws_formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+            "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s"
         )
         ws_handler.setFormatter(ws_formatter)
         lighter_ws_logger.addHandler(ws_handler)
-        lighter_ws_logger.propagate = False  # 不传播到父logger，避免重复
+        lighter_ws_logger.propagate = False
 
         print("=" * 70)
-        print("🔥 网格交易系统启动 - DEBUG 模式")
+        print("Grid Trading System Startup - DEBUG Mode")
         print("=" * 70)
-        print("⚠️  DEBUG模式已启用：将输出详细的调试信息")
+        print("Detailed debug logs will be written during startup and runtime")
         print("=" * 70)
     else:
         print("=" * 70)
-        print("🎯 网格交易系统启动")
+        print("Grid Trading System Startup")
         print("=" * 70)
 
     logger = get_system_logger()
 
     try:
-
-        # 1. 加载配置
-        print("\n📋 步骤 1/6: 加载配置文件...")
+        # 1. Load configuration.
+        print("\nStep 1/6: Loading configuration...")
         config_data = await load_config(config_path)
         grid_config = create_grid_config(config_data)
-        print(f"✅ 配置加载成功")
-        print(f"   - 交易所: {grid_config.exchange}")
-        print(f"   - 交易对: {grid_config.symbol}")
-        print(f"   - 网格类型: {grid_config.grid_type.value}")
+        print("Configuration loaded successfully")
+        print(f"   - Exchange: {grid_config.exchange}")
+        print(f"   - Symbol: {grid_config.symbol}")
+        print(f"   - Grid type: {grid_config.grid_type.value}")
 
-        # 🔥 现货做空校验：现货市场只能做多，不能做空
+        # Spot markets support only long-side grid modes.
         symbol = grid_config.symbol
         exchange_name = grid_config.exchange.lower()
         is_spot = False
 
-        # 检测是否为现货交易对
         if exchange_name == "hyperliquid":
             is_spot = ":SPOT" in symbol.upper()
         elif exchange_name == "backpack":
             is_spot = "_SPOT" in symbol.upper() or "SPOT" in symbol.upper()
 
-        # 如果是现货且选择了做空网格，拒绝启动
-        if is_spot and grid_config.grid_type.value in ["short", "martingale_short", "follow_short"]:
-            print(f"\n❌ 错误：现货市场不支持做空网格！")
-            print(f"   - 当前交易对: {symbol} (现货)")
-            print(f"   - 当前网格类型: {grid_config.grid_type.value} (做空)")
-            print(f"   - 建议：请使用做多网格类型 (long, martingale_long, follow_long)")
+        if is_spot and grid_config.grid_type.value in [
+            "short",
+            "martingale_short",
+            "follow_short",
+        ]:
+            print("\nError: spot markets do not support short grid modes")
+            print(f"   - Current symbol: {symbol} (spot)")
+            print(f"   - Current grid type: {grid_config.grid_type.value} (short)")
+            print(
+                "   - Suggested grid types: long, martingale_long, follow_long"
+            )
             sys.exit(1)
 
         if is_spot:
-            print(f"   ℹ️  现货市场：仅支持做多网格")
+            print("   - Spot market detected: only long grid modes are supported")
 
-        # 🔥 价格移动网格：价格区间在运行时动态设置
         if grid_config.is_follow_mode():
-            print(f"   - 价格区间: 动态跟随（运行时根据当前价格设置）")
+            print("   - Price range: dynamic follow mode (set at runtime)")
         else:
             print(
-                f"   - 价格区间: ${grid_config.lower_price:,.2f} - ${grid_config.upper_price:,.2f}")
+                f"   - Price range: ${grid_config.lower_price:,.2f} - ${grid_config.upper_price:,.2f}"
+            )
 
-        print(f"   - 网格间隔: ${grid_config.grid_interval}")
-        print(f"   - 网格数量: {grid_config.grid_count}个")
-        print(f"   - 订单数量: {grid_config.order_amount}")
+        print(f"   - Grid interval: ${grid_config.grid_interval}")
+        print(f"   - Grid count: {grid_config.grid_count}")
+        print(f"   - Order amount: {grid_config.order_amount}")
 
-        # 🔥 显示特殊模式参数
         if grid_config.is_martingale_mode():
-            print(f"   - 马丁递增: {grid_config.martingale_increment} (每格递增)")
+            print(
+                f"   - Martingale increment: {grid_config.martingale_increment} per grid"
+            )
         if grid_config.is_follow_mode():
-            print(f"   - 脱离超时: {grid_config.follow_timeout}秒")
-            print(f"   - 脱离距离: {grid_config.follow_distance}格")
+            print(f"   - Follow timeout: {grid_config.follow_timeout}s")
+            print(f"   - Follow distance: {grid_config.follow_distance} grids")
 
-        # 2. 创建交易所适配器
-        print("\n🔌 步骤 2/6: 连接交易所...")
+        # 2. Connect the exchange adapter.
+        print("\nStep 2/6: Connecting exchange...")
         exchange_adapter = await create_exchange_adapter(config_data)
-        print(f"✅ 交易所连接成功: {grid_config.exchange}")
+        print(f"Exchange connected successfully: {grid_config.exchange}")
 
-        # 3. 创建核心组件
-        print("\n⚙️  步骤 3/6: 初始化核心组件...")
+        # 3. Create core components.
+        print("\nStep 3/6: Initializing core components...")
 
-        # 创建策略
         strategy = GridStrategyImpl()
-        print("   ✓ 网格策略已创建")
+        print("   - Grid strategy created")
 
-        # 创建执行引擎
         engine = GridEngineImpl(exchange_adapter)
-        print("   ✓ 执行引擎已创建")
+        print("   - Execution engine created")
 
-        # 创建网格状态
         grid_state = GridState()
 
-        # 创建持仓跟踪器
         tracker = PositionTrackerImpl(grid_config, grid_state)
-        print("   ✓ 持仓跟踪器已创建")
+        print("   - Position tracker created")
 
-        # 🔥 创建预留管理器（仅现货）
+        # Create reserve management only for spot mode when enabled.
         reserve_manager = None
         reserve_monitor = None
 
         if exchange_adapter.config.exchange_type == ExchangeType.SPOT:
-            spot_reserve_config = getattr(grid_config, 'spot_reserve', None)
+            spot_reserve_config = getattr(grid_config, "spot_reserve", None)
 
-            if spot_reserve_config and spot_reserve_config.get('enabled', False):
-                print("   ✓ 现货预留管理已启用")
+            if spot_reserve_config and spot_reserve_config.get("enabled", False):
+                print("   - Spot reserve management enabled")
 
                 reserve_manager = SpotReserveManager(
                     reserve_config=spot_reserve_config,
                     exchange_adapter=exchange_adapter,
                     symbol=grid_config.symbol,
-                    quantity_precision=grid_config.quantity_precision
+                    quantity_precision=grid_config.quantity_precision,
                 )
 
-                # 创建监控器（稍后启动）
                 reserve_monitor = ReserveMonitor(
                     reserve_manager=reserve_manager,
                     exchange_adapter=exchange_adapter,
                     symbol=grid_config.symbol,
-                    check_interval=60
+                    check_interval=60,
                 )
-                print("   ✓ 预留监控器已创建")
+                print("   - Reserve monitor created")
 
-        # 4. 创建协调器
-        print("\n🎮 步骤 4/6: 创建系统协调器...")
+        # 4. Create the coordinator.
+        print("\nStep 4/6: Creating system coordinator...")
         coordinator = GridCoordinator(
             config=grid_config,
             strategy=strategy,
             engine=engine,
             tracker=tracker,
             grid_state=grid_state,
-            reserve_manager=reserve_manager  # 🔥 传入预留管理器
+            reserve_manager=reserve_manager,
         )
-        print("✅ 协调器创建成功")
+        print("Coordinator created successfully")
 
-        # 🔥 启动前检查（仅现货且启用预留管理）
+        # Run the startup reserve check only for spot mode with reserve management enabled.
         if reserve_manager:
-            print("\n🔍 启动前检查: 验证现货预留BTC...")
-            if not await check_spot_reserve_on_startup(grid_config, exchange_adapter, reserve_manager):
-                print("❌ 启动检查失败，系统退出")
+            print("\nStartup check: validating spot reserve balance...")
+            if not await check_spot_reserve_on_startup(
+                grid_config, exchange_adapter, reserve_manager
+            ):
+                print("Startup check failed, exiting")
                 await exchange_adapter.disconnect()
                 sys.exit(1)
-            print("✅ 预留检查通过")
+            print("Reserve validation passed")
 
-        # 5. 初始化并启动网格系统
-        print("\n🚀 步骤 5/6: 启动网格系统...")
-        print(f"   - 准备批量挂单：{grid_config.grid_count}个订单")
+        # 5. Start the grid system.
+        print("\nStep 5/6: Starting grid system...")
+        print(f"   - Preparing batch placement for {grid_config.grid_count} orders")
 
-        # 🔥 价格移动网格：价格区间在启动后才设置
         if not grid_config.is_follow_mode():
             print(
-                f"   - 覆盖价格区间：${grid_config.lower_price:,.2f} - ${grid_config.upper_price:,.2f}")
+                f"   - Target price range: ${grid_config.lower_price:,.2f} - ${grid_config.upper_price:,.2f}"
+            )
         else:
-            print(f"   - 价格区间：动态跟随（将根据当前价格设置）")
+            print("   - Price range: dynamic follow mode (set from current price)")
 
         await coordinator.start()
-        print("✅ 网格系统已启动")
-        print(f"   - 已成功挂出{grid_config.grid_count}个订单")
+        print("Grid system started")
+        print(f"   - Active startup order count: {grid_config.grid_count}")
 
-        # 🔥 启动预留监控（在网格启动后）
         if reserve_monitor:
             await reserve_monitor.start()
-            print("✅ 预留监控器已启动")
+            print("Reserve monitor started")
 
-        # 🔥 价格移动网格：显示实际设置的价格区间
         if grid_config.is_follow_mode():
             print(
-                f"   - 实际价格区间：${grid_config.lower_price:,.2f} - ${grid_config.upper_price:,.2f}")
+                f"   - Effective price range: ${grid_config.lower_price:,.2f} - ${grid_config.upper_price:,.2f}"
+            )
 
-        print(f"   - 所有网格已就位，等待成交...")
+        print("   - All grids are in place, waiting for fills...")
 
-        # 6. 启动终端界面
-        print("\n🖥️  步骤 6/6: 启动监控界面...")
+        # 6. Start the terminal UI.
+        print("\nStep 6/6: Starting terminal UI...")
         terminal_ui = GridTerminalUI(coordinator)
 
         print("=" * 70)
-        print("✅ 网格交易系统完全启动")
+        print("Grid Trading System Fully Started")
         print("=" * 70)
         print()
 
-        # 运行终端界面
         await terminal_ui.run()
 
     except KeyboardInterrupt:
-        print("\n\n⚠️  收到退出信号，正在停止系统...")
+        print("\n\nExit signal received, stopping the system...")
 
-    except Exception as e:
-        logger.error(f"❌ 系统错误: {e}", exc_info=True)
-        print(f"\n❌ 系统错误: {e}")
+    except Exception as exc:
+        logger.error(f"System error: {exc}", exc_info=True)
+        print(f"\nSystem error: {exc}")
 
     finally:
-        # 清理资源
-        print("\n🧹 清理资源...")
+        print("\nCleaning up resources...")
         try:
-            # 🔥 停止预留监控器
-            if 'reserve_monitor' in locals() and reserve_monitor:
+            if "reserve_monitor" in locals() and reserve_monitor:
                 await reserve_monitor.stop()
-                print("   ✓ 预留监控器已停止")
+                print("   - Reserve monitor stopped")
 
-            if 'coordinator' in locals():
+            if "coordinator" in locals():
                 await coordinator.stop()
-                print("   ✓ 网格系统已停止")
+                print("   - Grid system stopped")
 
-            if 'exchange_adapter' in locals():
+            if "exchange_adapter" in locals():
                 await exchange_adapter.disconnect()
-                print("   ✓ 交易所已断开")
+                print("   - Exchange disconnected")
 
-            print("\n✅ 系统已安全退出")
+            print("\nSystem exited safely")
 
-        except Exception as e:
-            print(f"⚠️  清理过程出错: {e}")
+        except Exception as exc:
+            print(f"Cleanup error: {exc}")
 
 
-def parse_arguments():
+def parse_arguments() -> argparse.Namespace:
     """
-    解析命令行参数
+    Parse command-line arguments.
 
     Returns:
-        argparse.Namespace: 解析后的参数
+        argparse.Namespace: Parsed arguments.
     """
     parser = argparse.ArgumentParser(
-        description='网格交易系统 - 支持多交易所的自动化网格交易',
+        description="Grid trading system for multiple exchanges",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例:
-  # 正常模式启动
+Examples:
+  # Start in normal mode
   python3 run_grid_trading.py config/grid/lighter_btc_perp_long.yaml
-  
-  # DEBUG 模式启动（输出详细日志）
+
+  # Start in DEBUG mode with detailed logs
   python3 run_grid_trading.py config/grid/lighter_btc_perp_long.yaml --debug
-  
-  # 🔸 Backpack 交易所
+
+  # Backpack exchange
   python3 run_grid_trading.py config/grid/backpack_capital_protection_long_btc.yaml
-  
-  # 🔹 Hyperliquid 交易所
+
+  # Hyperliquid exchange
   python3 run_grid_trading.py config/grid/hyperliquid_btc_perp_long.yaml
-  
-  # 🔶 Lighter 交易所
+
+  # Lighter exchange
   python3 run_grid_trading.py config/grid/lighter_btc_perp_long.yaml --debug
 
-支持的交易所:
-  ✅ Backpack    - 永续合约（做多/做空）
-  ✅ Hyperliquid - 永续合约（做多/做空）、现货（仅做多）
-  ✅ Lighter     - 永续合约（做多/做空）
+Supported exchanges:
+  Backpack    - Perpetual markets (long / short)
+  Hyperliquid - Perpetual markets (long / short), spot (long only)
+  Lighter     - Perpetual markets (long / short)
 
-注意事项:
-  1. 确保API密钥已正确配置
-  2. 确保有足够的资金用于网格交易
-  3. 建议先用小额资金测试
-  4. ⚠️  现货市场只支持做多，不支持做空
-  5. 网格系统会永久运行，除非手动停止
-  6. 使用 Ctrl+C 或 Q 键安全退出系统
-  7. DEBUG 模式会输出详细日志，适合排查问题
-        """
+Notes:
+  1. Make sure API credentials are configured correctly.
+  2. Make sure the account has enough capital for grid trading.
+  3. Start with small size before using larger capital.
+  4. Spot markets support long grids only.
+  5. The grid system runs continuously until it is stopped manually.
+  6. Use Ctrl+C or Q to exit safely.
+  7. DEBUG mode prints detailed logs for troubleshooting.
+        """,
     )
 
     parser.add_argument(
-        'config',
+        "config",
         type=str,
-        help='网格配置文件路径 (例如: config/grid/lighter_btc_perp_long.yaml)'
+        help="Grid config file path (for example: config/grid/lighter_btc_perp_long.yaml)",
     )
 
     parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='启用DEBUG模式，输出详细的调试日志'
+        "--debug",
+        action="store_true",
+        help="Enable DEBUG mode and print detailed diagnostic logs",
     )
 
     parser.add_argument(
-        '--version',
-        action='version',
-        version='网格交易系统 v2.0.0'
+        "--version",
+        action="version",
+        version="Grid Trading System v2.0.0",
     )
 
     return parser.parse_args()
@@ -713,41 +710,42 @@ def parse_arguments():
 
 if __name__ == "__main__":
     try:
-        # 解析命令行参数
+        # Parse command-line arguments.
         args = parse_arguments()
 
-        # 获取配置文件路径
+        # Resolve the config path.
         config_path = args.config
 
-        # 检查配置文件是否存在
+        # Ensure the config file exists before startup.
         if not Path(config_path).exists():
-            print(f"❌ 配置文件不存在: {config_path}")
-            print("\n使用 -h 或 --help 查看使用说明")
+            print(f"Config file does not exist: {config_path}")
+            print("\nUse -h or --help to view usage")
             sys.exit(1)
 
-        # 如果启用 DEBUG 模式，显示提示
+        # Print a short debug summary before startup.
         if args.debug:
             print("\n" + "=" * 70)
-            print("🔥 DEBUG 模式已启用")
+            print("DEBUG mode enabled")
             print("=" * 70)
-            print("📝 将输出详细的调试日志，包括：")
-            print("   - WebSocket 消息详情")
-            print("   - REST API 调用参数")
-            print("   - 订单匹配逻辑")
-            print("   - 持仓和余额更新")
+            print("Detailed logs will include:")
+            print("   - WebSocket message details")
+            print("   - REST API call parameters")
+            print("   - Order matching behavior")
+            print("   - Position and balance updates")
             print("=" * 70)
             print()
 
-        # 运行主程序
+        # Run the application.
         asyncio.run(main(config_path, debug=args.debug))
 
     except KeyboardInterrupt:
-        print("\n👋 程序已退出")
+        print("\nProgram exited")
     except SystemExit:
-        # argparse 的 --help 或 --version 会触发 SystemExit
+        # argparse --help and --version trigger SystemExit intentionally.
         pass
-    except Exception as e:
-        print(f"\n❌ 启动失败: {e}")
+    except Exception as exc:
+        print(f"\nStartup failed: {exc}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
