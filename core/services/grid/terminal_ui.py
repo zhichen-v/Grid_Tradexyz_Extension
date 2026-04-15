@@ -121,7 +121,7 @@ class GridTerminalUI:
             "Price range",
             f"${stats.price_range[0]:,.2f} - ${stats.price_range[1]:,.2f}",
         )
-        self._append_field(content, "Grid interval", f"${stats.grid_interval}", value_style="cyan")
+        self._append_field(content, "Grid interval", f"{stats.grid_interval}", value_style="cyan")
         self._append_field(
             content,
             "Reverse distance",
