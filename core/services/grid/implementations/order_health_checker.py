@@ -41,6 +41,11 @@ class OrderHealthChecker:
             getattr(self.engine, "_missing_order_resolution_timeout", 20.0)
         )
         self._restored_missing_orders_in_sync = 0
+        self._runtime_consistency_log_key: Optional[Tuple[str, str]] = None
+        self._runtime_consistency_log_time = 0.0
+        self._health_summary_log_key: Optional[str] = None
+        self._health_summary_log_time = 0.0
+        self._position_repair_skip_logged = False
 
         # Reuse the shared line-limited handler and keep file output at INFO.
         self.logger.logger.setLevel(logging.INFO)
@@ -112,7 +117,7 @@ class OrderHealthChecker:
             )
 
             local_count = len(self.engine.get_pending_orders())
-            self.logger.info(
+            self._log_health_summary(
                 f"Health check complete: exchange_orders={len(exchange_orders)}, "
                 f"local_orders={local_count}, repairs={repair_count}"
             )
@@ -551,11 +556,12 @@ class OrderHealthChecker:
         tolerance = self._position_tolerance()
 
         if deferred:
-            self.logger.info(
+            self._log_runtime_consistency_message(
+                "info",
                 "Runtime consistency check deferred: "
                 f"unresolved_orders={unresolved_orders}, restored_missing_orders={self._restored_missing_orders_in_sync}, "
                 f"exchange_orders={len(exchange_keys)}, engine_orders={len(engine_keys)}, state_orders={len(state_keys)}, "
-                f"exchange_position={actual_position}, tracker_position={tracker_position}, state_position={state_position}"
+                f"exchange_position={actual_position}, tracker_position={tracker_position}, state_position={state_position}",
             )
             return
 
@@ -587,22 +593,27 @@ class OrderHealthChecker:
 
         tp_open_amount = self._get_open_take_profit_amount(exchange_orders)
         expected_tp_amount = self._get_expected_take_profit_amount(actual_position)
-        if abs(tp_open_amount - expected_tp_amount) > tolerance:
+        partial_tp_gap_allowance = self._get_pending_partial_base_fill_exposure()
+        tp_gap = abs(tp_open_amount - expected_tp_amount)
+        if tp_gap > (tolerance + partial_tp_gap_allowance):
             issues.append(
-                f"take_profit_coverage={tp_open_amount} != expected_take_profit={expected_tp_amount}"
+                f"take_profit_coverage={tp_open_amount} != expected_take_profit={expected_tp_amount} "
+                f"(partial_fill_allowance={partial_tp_gap_allowance})"
             )
 
         if issues:
-            self.logger.warning(
-                "Runtime consistency issue detected: " + "; ".join(issues)
+            self._log_runtime_consistency_message(
+                "warning",
+                "Runtime consistency issue detected: " + "; ".join(issues),
             )
             return
 
-        self.logger.info(
+        self._log_runtime_consistency_message(
+            "info",
             "Runtime consistency verified: "
             f"exchange_orders={len(exchange_keys)}, engine_orders={len(engine_keys)}, state_orders={len(state_keys)}, "
             f"exchange_position={actual_position}, tracker_position={tracker_position}, state_position={state_position}, "
-            f"take_profit_coverage={tp_open_amount}"
+            f"take_profit_coverage={tp_open_amount}, partial_fill_allowance={partial_tp_gap_allowance}",
         )
 
     def _get_exchange_open_order_keys(self, exchange_orders: List[OrderData]) -> set[Tuple[int, str]]:
@@ -667,23 +678,13 @@ class OrderHealthChecker:
     def _get_open_take_profit_amount(self, exchange_orders: List[OrderData]) -> Decimal:
         """Return the total open take-profit amount implied by exchange orders."""
         total = Decimal("0")
-        if self.config.grid_type in {
-            GridType.LONG,
-            GridType.FOLLOW_LONG,
-            GridType.MARTINGALE_LONG,
-        }:
-            target_side = "sell"
-        elif self.config.grid_type in {
-            GridType.SHORT,
-            GridType.FOLLOW_SHORT,
-            GridType.MARTINGALE_SHORT,
-        }:
-            target_side = "buy"
-        else:
+        tracked_tp_keys = self._get_tracked_take_profit_price_keys()
+        if not tracked_tp_keys:
             return total
 
         for order in exchange_orders:
-            if order.side.value.lower() != target_side:
+            key = (self._normalize_price_key(order.price), order.side.value.lower())
+            if key not in tracked_tp_keys:
                 continue
             total += Decimal(str(order.amount or 0))
         return total
@@ -872,12 +873,139 @@ class OrderHealthChecker:
         """Return whether automatic position repair should run for this exchange."""
         exchange_name = str(getattr(self.config, "exchange", "")).lower()
         if exchange_name == "tradexyz":
-            self.logger.info(
-                "Skip position repair for TradeXYZ because open-order based exposure "
-                "estimation is not reliable enough for safe market repair"
-            )
+            if not self._position_repair_skip_logged:
+                self.logger.info(
+                    "Skip position repair for TradeXYZ because open-order based exposure "
+                    "estimation is not reliable enough for safe market repair"
+                )
+                self._position_repair_skip_logged = True
             return False
         return True
+
+    def _log_runtime_consistency_message(
+        self,
+        level: str,
+        message: str,
+        throttle_seconds: float = 300.0,
+    ) -> None:
+        """Avoid writing the same runtime-consistency message every health-check cycle."""
+        now = time.time()
+        log_key = (level, message)
+        if (
+            log_key == self._runtime_consistency_log_key
+            and (now - self._runtime_consistency_log_time) < throttle_seconds
+        ):
+            return
+
+        getattr(self.logger, level)(message)
+        self._runtime_consistency_log_key = log_key
+        self._runtime_consistency_log_time = now
+
+    def _log_health_summary(self, message: str, throttle_seconds: float = 300.0) -> None:
+        """Avoid writing identical health-check summaries every cycle."""
+        now = time.time()
+        if (
+            message == self._health_summary_log_key
+            and (now - self._health_summary_log_time) < throttle_seconds
+        ):
+            return
+
+        self.logger.info(message)
+        self._health_summary_log_key = message
+        self._health_summary_log_time = now
+
+    def _iter_unique_local_pending_orders(self) -> Iterable[GridOrder]:
+        """Yield unique pending-order objects across coordinator state and engine cache."""
+        seen: set[int] = set()
+
+        coordinator = getattr(self.engine, "coordinator", None)
+        state = getattr(coordinator, "state", None) if coordinator else None
+        if state and getattr(state, "active_orders", None):
+            for order in state.active_orders.values():
+                if getattr(order, "status", None) != GridOrderStatus.PENDING:
+                    continue
+                order_ref = id(order)
+                if order_ref in seen:
+                    continue
+                seen.add(order_ref)
+                yield order
+
+        for order in self.engine.get_pending_orders():
+            if getattr(order, "status", None) != GridOrderStatus.PENDING:
+                continue
+            order_ref = id(order)
+            if order_ref in seen:
+                continue
+            seen.add(order_ref)
+            yield order
+
+    def _get_tracked_take_profit_price_keys(self) -> set[Tuple[str, str]]:
+        """Return normalized price-side keys for locally tracked reverse/TP orders."""
+        tp_keys: set[Tuple[str, str]] = set()
+        scalping_tp_id = self._get_scalping_take_profit_order_id()
+
+        for order in self._iter_unique_local_pending_orders():
+            if getattr(order, "parent_order_id", None) or (
+                scalping_tp_id and getattr(order, "order_id", None) == scalping_tp_id
+            ):
+                tp_keys.add((self._normalize_price_key(order.price), order.side.value.lower()))
+
+        return tp_keys
+
+    def _get_scalping_take_profit_order_id(self) -> Optional[str]:
+        """Return the active scalping TP order id when scalping mode is enabled."""
+        coordinator = getattr(self.engine, "coordinator", None)
+        scalping_manager = getattr(coordinator, "scalping_manager", None) if coordinator else None
+        if not scalping_manager:
+            return None
+
+        try:
+            tp_order = scalping_manager.get_current_take_profit_order()
+        except Exception:
+            return None
+
+        if not tp_order:
+            return None
+        return getattr(tp_order, "order_id", None)
+
+    def _get_pending_partial_base_fill_exposure(self) -> Decimal:
+        """Return live exposure caused by partial base fills that should not yet have TP coverage."""
+        base_side = self._base_side_for_grid_type()
+        if base_side is None:
+            return Decimal("0")
+
+        total = Decimal("0")
+        for order in self._iter_unique_local_pending_orders():
+            if order.side != base_side:
+                continue
+            if getattr(order, "parent_order_id", None):
+                continue
+
+            tracking = getattr(order, "exchange_data", {}) or {}
+            fill_tracking = tracking.get("tradexyz_fill_tracking", {})
+            if not isinstance(fill_tracking, dict):
+                continue
+
+            cumulative_filled = self._decimal_or_zero(fill_tracking.get("cumulative_filled"))
+            if cumulative_filled <= 0:
+                continue
+
+            order_amount = self._decimal_or_zero(getattr(order, "amount", Decimal("0")))
+            if order_amount > 0:
+                cumulative_filled = min(cumulative_filled, order_amount)
+            total += cumulative_filled
+
+        return total
+
+    @staticmethod
+    def _decimal_or_zero(value: object) -> Decimal:
+        """Convert an arbitrary numeric value to Decimal, defaulting invalid values to zero."""
+        try:
+            if value is None:
+                return Decimal("0")
+            return Decimal(str(value))
+        except Exception:
+            return Decimal("0")
 
     def _calculate_expected_position(self, exchange_orders: List[OrderData]) -> Decimal:
         """Estimate target exposure from current open buy/sell grid counts."""

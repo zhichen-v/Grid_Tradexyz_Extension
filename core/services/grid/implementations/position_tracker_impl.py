@@ -57,6 +57,7 @@ class PositionTrackerImpl(IPositionTracker):
         self.buy_count = 0
         self.sell_count = 0
         self.completed_cycles = 0
+        self._completed_cycle_profit_total = Decimal('0')
 
         # 资金信息（需要从交易所获取）
         self.available_balance = Decimal('0')
@@ -100,6 +101,7 @@ class PositionTrackerImpl(IPositionTracker):
 
         # 用于记录交易历史的盈亏
         profit = None
+        cycle_profit = None
         parent_fill = self._get_parent_fill(order)
 
         # 🔥 统计计数和盈亏计算（仅用于显示）
@@ -107,6 +109,7 @@ class PositionTrackerImpl(IPositionTracker):
             self.buy_count += 1
             if parent_fill and parent_fill['side'] == 'sell':
                 profit = (parent_fill['price'] - filled_price) * filled_amount
+                cycle_profit = profit
                 self.realized_pnl += profit
 
                 self.logger.debug(
@@ -123,6 +126,7 @@ class PositionTrackerImpl(IPositionTracker):
             # 使用REST同步的average_cost来计算
             if parent_fill and parent_fill['side'] == 'buy':
                 profit = (filled_price - parent_fill['price']) * filled_amount
+                cycle_profit = profit
                 self.realized_pnl += profit
 
                 self.logger.debug(
@@ -151,7 +155,9 @@ class PositionTrackerImpl(IPositionTracker):
         self.total_fees += fee
 
         # 更新完成循环次数
-        self.completed_cycles = min(self.buy_count, self.sell_count)
+        if cycle_profit is not None:
+            self.completed_cycles += 1
+            self._completed_cycle_profit_total += cycle_profit
 
         # 🔥 记录交易历史（用于终端UI显示）
         self._store_filled_order(order, filled_price, filled_amount)
@@ -332,6 +338,12 @@ class PositionTrackerImpl(IPositionTracker):
             last_trade_time=self.last_trade_time
         )
 
+        statistics.avg_cycle_profit = (
+            self._completed_cycle_profit_total / Decimal(str(self.completed_cycles))
+            if self.completed_cycles > 0
+            else Decimal('0')
+        )
+
         return statistics
 
     def get_metrics(self) -> GridMetrics:
@@ -374,7 +386,7 @@ class PositionTrackerImpl(IPositionTracker):
 
         # 计算平均每笔收益
         if self.completed_cycles > 0:
-            metrics.avg_profit_per_trade = self.realized_pnl / \
+            metrics.avg_profit_per_trade = self._completed_cycle_profit_total / \
                 Decimal(str(self.completed_cycles))
 
         # 手续费统计
@@ -426,6 +438,7 @@ class PositionTrackerImpl(IPositionTracker):
         self.buy_count = 0
         self.sell_count = 0
         self.completed_cycles = 0
+        self._completed_cycle_profit_total = Decimal('0')
         self.start_time = datetime.now()
         self.last_trade_time = datetime.now()
 

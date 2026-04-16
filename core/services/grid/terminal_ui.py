@@ -644,10 +644,14 @@ class GridTerminalUI:
     def create_trigger_panel(self, stats: GridStatistics) -> Panel:
         """Create the trigger statistics panel."""
         content = Text()
-        avg_cycle_profit = (
-            stats.realized_profit / stats.completed_cycles
-            if stats.completed_cycles > 0
-            else Decimal("0")
+        avg_cycle_profit = getattr(
+            stats,
+            "avg_cycle_profit",
+            (
+                stats.realized_profit / stats.completed_cycles
+                if stats.completed_cycles > 0
+                else Decimal("0")
+            ),
         )
 
         self._append_field(content, "Buy fills", str(stats.filled_buy_count), value_style="green")
@@ -667,7 +671,7 @@ class GridTerminalUI:
         self._append_field(
             content,
             "Avg cycle profit",
-            f"${avg_cycle_profit:,.2f}",
+            f"${avg_cycle_profit:,.4f}",
             value_style="green" if avg_cycle_profit > 0 else "white",
         )
 
