@@ -57,6 +57,7 @@ class PositionTrackerImpl(IPositionTracker):
         self.buy_count = 0
         self.sell_count = 0
         self.completed_cycles = 0
+        self._completed_profit_cycle_count = 0
         self._completed_cycle_profit_total = Decimal('0')
 
         # 资金信息（需要从交易所获取）
@@ -150,13 +151,15 @@ class PositionTrackerImpl(IPositionTracker):
                     f"Recorded short-side sell fill: {filled_amount}@{filled_price}"
                 )
 
+        self.completed_cycles = min(self.buy_count, self.sell_count)
+
         # 📊 计算手续费（仅用于统计显示）
         fee = filled_price * filled_amount * self.config.fee_rate
         self.total_fees += fee
 
         # 更新完成循环次数
         if cycle_profit is not None:
-            self.completed_cycles += 1
+            self._completed_profit_cycle_count += 1
             self._completed_cycle_profit_total += cycle_profit
 
         # 🔥 记录交易历史（用于终端UI显示）
@@ -339,8 +342,8 @@ class PositionTrackerImpl(IPositionTracker):
         )
 
         statistics.avg_cycle_profit = (
-            self._completed_cycle_profit_total / Decimal(str(self.completed_cycles))
-            if self.completed_cycles > 0
+            self._completed_cycle_profit_total / Decimal(str(self._completed_profit_cycle_count))
+            if self._completed_profit_cycle_count > 0
             else Decimal('0')
         )
 
@@ -385,9 +388,9 @@ class PositionTrackerImpl(IPositionTracker):
             metrics.running_days = running_days
 
         # 计算平均每笔收益
-        if self.completed_cycles > 0:
+        if self._completed_profit_cycle_count > 0:
             metrics.avg_profit_per_trade = self._completed_cycle_profit_total / \
-                Decimal(str(self.completed_cycles))
+                Decimal(str(self._completed_profit_cycle_count))
 
         # 手续费统计
         metrics.total_fees = self.total_fees
@@ -438,6 +441,7 @@ class PositionTrackerImpl(IPositionTracker):
         self.buy_count = 0
         self.sell_count = 0
         self.completed_cycles = 0
+        self._completed_profit_cycle_count = 0
         self._completed_cycle_profit_total = Decimal('0')
         self.start_time = datetime.now()
         self.last_trade_time = datetime.now()

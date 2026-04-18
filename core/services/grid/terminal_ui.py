@@ -443,116 +443,19 @@ class GridTerminalUI:
         )
 
         position_value = abs(stats.current_position) * stats.average_cost
-        data_source = stats.position_data_source or "Unknown"
-        if "WebSocket" in data_source:
-            source_prefix = "WS"
-            source_style = "bold green"
-        elif "REST" in data_source:
-            source_prefix = "REST"
-            source_style = "bold yellow"
-        else:
-            source_prefix = "SYNC"
-            source_style = "cyan"
-
         self._append_field(
             content,
             "Position",
             f"{stats.current_position:+.5f} {self.base_currency} ({position_type})",
             value_style=f"bold {position_color}",
         )
-        self._append_field(content, "Average cost", f"${stats.average_cost:,.2f}")
+        self._append_field(content, "Average Cost", f"${stats.average_cost:,.2f}")
         self._append_field(
             content,
-            "Position value",
+            "Position Value",
             f"${position_value:,.2f}",
             value_style="bold cyan",
         )
-        self._append_field(
-            content,
-            "Data source",
-            f"{source_prefix} {data_source}",
-            value_style=source_style,
-        )
-        self._append_field(content, "Initial capital", f"${stats.initial_capital:,.3f} USDC")
-        self._append_field(
-            content,
-            "Current equity",
-            f"${stats.collateral_balance:,.3f} USDC",
-            value_style="yellow",
-        )
-
-        capital_profit = stats.capital_profit_loss
-        capital_rate = (
-            capital_profit / stats.initial_capital * 100
-            if stats.initial_capital > 0
-            else Decimal("0")
-        )
-        prefix = "+" if capital_profit >= 0 else ""
-        profit_style = "bold green" if capital_profit >= 0 else "bold red"
-        self._append_field(
-            content,
-            "Capital PnL",
-            f"{prefix}${capital_profit:,.3f} ({prefix}{capital_rate:.2f}%)",
-            value_style=profit_style,
-        )
-
-        if stats.capital_protection_enabled:
-            self._append_field(
-                content,
-                "Capital protect",
-                "Triggered" if stats.capital_protection_active else "Pending",
-                value_style="bold green" if stats.capital_protection_active else "bold cyan",
-            )
-
-        if stats.price_lock_enabled:
-            lock_text = (
-                "Active (locked)"
-                if stats.price_lock_active
-                else f"Pending | threshold ${stats.price_lock_threshold:,.2f}"
-            )
-            lock_style = "bold yellow" if stats.price_lock_active else "bold cyan"
-            self._append_field(content, "Price lock", lock_text, value_style=lock_style)
-
-        self._append_field(content, "Spot balance", f"${stats.spot_balance:,.2f} USDC")
-        self._append_field(content, "Order lock", f"${stats.order_locked_balance:,.2f} USDC")
-
-        if self.coordinator.reserve_manager:
-            reserve_status = self.coordinator.reserve_manager.get_status()
-            health_percent = reserve_status["health_percent"]
-            if health_percent >= 50:
-                health_style = "bold green"
-            elif health_percent >= 30:
-                health_style = "bold yellow"
-            else:
-                health_style = "bold red"
-
-            reserve_amount = reserve_status["reserve_amount"]
-            current_reserve = reserve_status["current_reserve"]
-            total_consumed = reserve_status["total_consumed"]
-            reserve_currency = self.coordinator.reserve_manager.base_currency
-
-            self._append_field(
-                content,
-                f"Reserve {reserve_currency}",
-                f"{current_reserve:.8f}/{reserve_amount:.8f} {reserve_currency}",
-                value_style=health_style,
-            )
-            self._append_field(
-                content,
-                "Reserve health",
-                f"{health_percent:.1f}%",
-                value_style=health_style,
-            )
-            self._append_field(
-                content,
-                "Reserve usage",
-                (
-                    f"consumed {total_consumed:.8f} {reserve_currency} | "
-                    f"trades {reserve_status['trades_count']} | "
-                    f"refills {reserve_status['replenish_count']}"
-                ),
-                value_style="cyan",
-            )
 
         liquidation_price, distance_percent, risk_level = self._calculate_liquidation_price(
             stats
@@ -712,19 +615,6 @@ class GridTerminalUI:
             trade_time = trade_time.replace(tzinfo=timezone.utc)
         return trade_time.astimezone(self.DISPLAY_TIMEZONE).strftime("%H:%M:%S")
 
-    def create_controls_panel(self) -> Panel:
-        """Create the controls panel."""
-        controls = Text()
-        controls.append("[P]", style="bold yellow")
-        controls.append(" Pause   ", style="white")
-        controls.append("[R]", style="bold green")
-        controls.append(" Resume   ", style="white")
-        controls.append("[S]", style="bold red")
-        controls.append(" Stop   ", style="white")
-        controls.append("[Q]", style="bold cyan")
-        controls.append(" Quit", style="white")
-        return Panel(controls, title="Controls", border_style="white")
-
     def create_orders_panel_display(self, stats: GridStatistics) -> Panel:
         """Create the display-adjusted order status panel."""
         content = Text()
@@ -800,9 +690,8 @@ class GridTerminalUI:
         layout = Layout()
         layout.split_column(
             Layout(self.create_header(stats), size=3),
-            Layout(name="summary"),
-            Layout(self.create_recent_trades_table(stats), size=9),
-            Layout(self.create_controls_panel(), size=3),
+            Layout(name="summary", ratio=7),
+            Layout(self.create_recent_trades_table(stats), ratio=4),
         )
 
         layout["summary"].split_row(
