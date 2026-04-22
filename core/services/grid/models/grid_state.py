@@ -218,6 +218,7 @@ class GridState:
         del self.active_orders[order_id]
         
         self.last_update_at = datetime.now()
+        return True
     
     def remove_order(self, order_id: str):
         """移除订单（取消或失败）"""
@@ -300,7 +301,6 @@ class GridState:
         self.current_position = position
         self.average_cost = average_cost
         self.last_update_at = datetime.now()
-        return True
 
     def __repr__(self) -> str:
         return (
