@@ -1,31 +1,44 @@
 """
-Trading System 核心模块
+Core package exports.
 
-新架构的核心模块，提供依赖注入和服务接口。
-
-主要组件：
-- di: 依赖注入容器
-- services: 服务层接口和实现
-- domain: 领域模型
-- infrastructure: 基础设施层
-- adapters: 适配器层
+Keep top-level imports lazy so importing `core.*` submodules does not
+eagerly initialize unrelated services such as DI or event handling.
 """
+
+from importlib import import_module
+from typing import Any
 
 __version__ = "2.0.0"
 __author__ = "Trading System Team"
 
-# 导入新架构的核心组件
-from .di.container import get_container, DIContainer
-from .services.interfaces.base import IService, BaseService
-# 日志服务已简化，直接使用统一入口
-# from .services.interfaces.logging import ILoggingService
-from .services.interfaces.monitoring_service import MonitoringService
+_LAZY_EXPORTS = {
+    "get_container": ("core.di.container", "get_container"),
+    "DIContainer": ("core.di.container", "DIContainer"),
+    "IService": ("core.services.interfaces.base", "IService"),
+    "BaseService": ("core.services.interfaces.base", "BaseService"),
+    "MonitoringService": (
+        "core.services.interfaces.monitoring_service",
+        "MonitoringService",
+    ),
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily load top-level exports to avoid package import side effects."""
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module 'core' has no attribute '{name}'")
+
+    module_name, attr_name = _LAZY_EXPORTS[name]
+    module = import_module(module_name)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     "get_container",
     "DIContainer",
     "IService",
     "BaseService",
-    # "ILoggingService",  # 已简化，使用 core.logging 统一入口
-    "MonitoringService"
+    "MonitoringService",
 ]

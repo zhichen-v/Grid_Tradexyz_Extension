@@ -192,12 +192,14 @@ class BalanceMonitor:
                 # 检查止盈条件（如果启用）
                 if self.coordinator.take_profit_manager:
                     if self.coordinator.take_profit_manager.get_initial_capital() > 0:
+                        symbol_snapshot = self.coordinator.get_symbol_isolated_snapshot()
+                        current_equity = symbol_snapshot["current_equity"]
                         if self.coordinator.take_profit_manager.check_take_profit_condition(
-                            self._collateral_balance
+                            current_equity
                         ):
                             # 触发止盈
                             self.coordinator.take_profit_manager.activate(
-                                self._collateral_balance)
+                                current_equity)
                             # 🔥 使用新模块执行止盈重置
                             await self.coordinator.reset_manager.execute_take_profit_reset()
 
@@ -286,33 +288,9 @@ class BalanceMonitor:
                 self.logger.info(
                     f"💰 初始本金已记录: ${self._initial_capital:,.3f} USDC")
 
-        # 本金保护管理器
-        if self.coordinator.capital_protection_manager:
-            if self.coordinator.capital_protection_manager.get_initial_capital() == Decimal('0'):
-                self.coordinator.capital_protection_manager.initialize_capital(
-                    self._collateral_balance)
-
-        # 止盈管理器
-        if self.coordinator.take_profit_manager:
-            if self.coordinator.take_profit_manager.get_initial_capital() == Decimal('0'):
-                self.coordinator.take_profit_manager.initialize_capital(
-                    self._collateral_balance, is_reinit=False)
-
-        # 剥头皮管理器（首次初始化）
-        if self.coordinator.scalping_manager:
-            scalping_current_capital = self.coordinator.scalping_manager.get_initial_capital()
-
-            if scalping_current_capital == Decimal('0'):
-                # 首次初始化（启动时）
-                # 🔥 现货模式：即使价格为0，也先用USDC初始化，后续会自动更新
-                if self._is_spot_mode():
-                    # 使用 collateral_balance 属性（会包含BTC价值，如果价格可用）
-                    self.coordinator.scalping_manager.initialize_capital(
-                        self.collateral_balance)
-                else:
-                    # 合约模式直接用USDC余额
-                    self.coordinator.scalping_manager.initialize_capital(
-                        self._collateral_balance)
+        self.coordinator.ensure_symbol_isolated_capital(
+            current_price=self._get_current_price()
+        )
 
     def _safe_decimal(self, value, default='0') -> Decimal:
         """安全转换为Decimal"""

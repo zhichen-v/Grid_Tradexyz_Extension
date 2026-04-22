@@ -194,10 +194,11 @@ class PositionMonitor:
 
                     # 更新剥头皮管理器
                     if self.coordinator.scalping_manager and self.coordinator.scalping_manager.is_active():
-                        initial_capital = self.coordinator.scalping_manager.get_initial_capital()
+                        symbol_snapshot = self.coordinator.get_symbol_isolated_snapshot()
                         self.coordinator.scalping_manager.update_position(
                             Decimal('0'), Decimal('0'),
-                            initial_capital, self.coordinator.balance_monitor.collateral_balance
+                            symbol_snapshot["initial_capital"],
+                            symbol_snapshot["current_equity"],
                         )
 
                 # 🆕 REST查询成功
@@ -234,10 +235,13 @@ class PositionMonitor:
 
             # 更新剥头皮管理器（如果持仓变化）
             if position_changed and self.coordinator.scalping_manager and self.coordinator.scalping_manager.is_active():
-                initial_capital = self.coordinator.scalping_manager.get_initial_capital()
+                symbol_snapshot = self.coordinator.get_symbol_isolated_snapshot(
+                    current_price=entry_price
+                )
                 self.coordinator.scalping_manager.update_position(
                     position_qty, entry_price,
-                    initial_capital, self.coordinator.balance_monitor.collateral_balance
+                    symbol_snapshot["initial_capital"],
+                    symbol_snapshot["current_equity"],
                 )
 
             # 记录日志

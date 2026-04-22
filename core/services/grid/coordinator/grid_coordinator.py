@@ -180,6 +180,8 @@ class GridCoordinator:
         self._spot_balance: Decimal = Decimal('0')  # 现货余额（未用作保证金）
         self._collateral_balance: Decimal = Decimal('0')  # 抵押品余额（用作保证金）
         self._order_locked_balance: Decimal = Decimal('0')  # 订单冻结余额
+        self._symbol_initial_capital: Decimal = Decimal('0')
+        self._symbol_reference_price: Decimal = Decimal('0')
 
         # 🔥 新增：模块化组件初始化
         self.reset_manager = GridResetManager(
@@ -222,6 +224,8 @@ class GridCoordinator:
                     f"Follow-mode price range updated from market price ${current_price:,.2f}: "
                     f"[${self.config.lower_price:,.2f}, ${self.config.upper_price:,.2f}]"
                 )
+
+            self.ensure_symbol_isolated_capital(current_price=current_price)
 
             # 2. 初始化网格状态
             self.state.initialize_grid_levels(
@@ -454,10 +458,12 @@ class GridCoordinator:
                 # 更新持仓信息到剥头皮管理器
                 current_position = self.tracker.get_current_position()
                 average_cost = self.tracker.get_average_cost()
-                initial_capital = self.scalping_manager.get_initial_capital()
+                symbol_snapshot = self.get_symbol_isolated_snapshot()
                 self.scalping_manager.update_position(
-                    current_position, average_cost, initial_capital,
-                    self.balance_monitor.collateral_balance
+                    current_position,
+                    average_cost,
+                    symbol_snapshot["initial_capital"],
+                    symbol_snapshot["current_equity"],
                 )
 
                 # 检查是否需要更新止盈订单
@@ -911,12 +917,14 @@ class GridCoordinator:
 
                 # 更新scalping_manager的持仓信息
                 if position_data['size'] != 0:
-                    initial_capital = self.scalping_manager.get_initial_capital()
+                    symbol_snapshot = self.get_symbol_isolated_snapshot(
+                        current_price=current_price
+                    )
                     self.scalping_manager.update_position(
                         position_data['size'],
                         position_data['entry_price'],
-                        initial_capital,
-                        self.balance_monitor.collateral_balance  # 🔥 使用 BalanceMonitor 的余额
+                        symbol_snapshot["initial_capital"],
+                        symbol_snapshot["current_equity"],
                     )
 
                 # 检查是否应该触发剥头皮模式（需要传递current_price和current_grid_id）
@@ -1097,19 +1105,14 @@ class GridCoordinator:
         stats.total_balance = balances['total_balance']
 
         # 💰 初始本金和盈亏（始终设置，无论是否启用本金保护）
-        stats.initial_capital = self.balance_monitor.initial_capital
-        if stats.initial_capital > 0:
-            stats.capital_profit_loss = self.balance_monitor.collateral_balance - \
-                stats.initial_capital
-        else:
-            stats.capital_profit_loss = Decimal('0')
+        symbol_snapshot = self.get_symbol_isolated_snapshot(current_price=current_price)
+        stats.initial_capital = symbol_snapshot['initial_capital']
+        stats.strategy_equity = symbol_snapshot['current_equity']
+        stats.capital_profit_loss = symbol_snapshot['net_profit']
 
         stats.total_profit = stats.realized_profit + stats.unrealized_profit
         stats.net_profit = stats.total_profit - stats.total_fees
-        if stats.initial_capital > 0:
-            stats.profit_rate = (stats.net_profit / stats.initial_capital) * 100
-        else:
-            stats.profit_rate = Decimal('0')
+        stats.profit_rate = symbol_snapshot['profit_rate']
 
         # 🛡️ 本金保护模式状态
         if self.capital_protection_manager:
@@ -1138,9 +1141,9 @@ class GridCoordinator:
             stats.take_profit_active = self.take_profit_manager.is_active()
             stats.take_profit_initial_capital = self.take_profit_manager.get_initial_capital()
             stats.take_profit_current_profit = self.take_profit_manager.get_profit_amount(
-                self.balance_monitor.collateral_balance)  # 🔥 使用 BalanceMonitor 的余额
+                symbol_snapshot['current_equity'])
             stats.take_profit_profit_rate = self.take_profit_manager.get_profit_percentage(
-                self.balance_monitor.collateral_balance)  # 🔥 使用 BalanceMonitor 的余额
+                symbol_snapshot['current_equity'])
             stats.take_profit_threshold = self.config.take_profit_percentage * 100  # 转为百分比
 
         # 🔒 价格锁定模式状态
@@ -1219,10 +1222,15 @@ class GridCoordinator:
                         )
 
                         # 更新剥头皮管理器的持仓信息
-                        initial_capital = self.scalping_manager.get_initial_capital()
+                        symbol_snapshot = self.get_symbol_isolated_snapshot(
+                            current_price=current_entry_price
+                        )
                         self.scalping_manager.update_position(
-                            current_position, current_entry_price, initial_capital,
-                            self.balance_monitor.collateral_balance)  # 🔥 使用 BalanceMonitor 的余额
+                            current_position,
+                            current_entry_price,
+                            symbol_snapshot["initial_capital"],
+                            symbol_snapshot["current_equity"],
+                        )
 
                         # 更新止盈订单
                         await self._update_take_profit_order_after_position_change(
@@ -1322,10 +1330,15 @@ class GridCoordinator:
                 )
 
                 # 更新剥头皮管理器
-                initial_capital = self.scalping_manager.get_initial_capital()
+                symbol_snapshot = self.get_symbol_isolated_snapshot(
+                    current_price=entry_price
+                )
                 self.scalping_manager.update_position(
-                    current_position, entry_price, initial_capital,
-                    self.balance_monitor.collateral_balance)  # 🔥 使用 BalanceMonitor 的余额
+                    current_position,
+                    entry_price,
+                    symbol_snapshot["initial_capital"],
+                    symbol_snapshot["current_equity"],
+                )
 
                 # 更新止盈订单
                 await self._update_take_profit_order_after_position_change(
@@ -1468,8 +1481,11 @@ class GridCoordinator:
         # 如果已经触发，检查是否回本
         if self.capital_protection_manager.is_active():
             # 检查抵押品是否回本
+            symbol_snapshot = self.get_symbol_isolated_snapshot(
+                current_price=current_price
+            )
             if self.capital_protection_manager.check_capital_recovery(
-                self.balance_monitor.collateral_balance
+                symbol_snapshot["current_equity"]
             ):
                 self.logger.warning(
                     "Capital protection target recovered; resetting grid"
@@ -1596,16 +1612,11 @@ class GridCoordinator:
 
             # 🔥 重新初始化本金（止盈后）
             if new_capital is not None:
-                if self.capital_protection_manager:
-                    self.capital_protection_manager.initialize_capital(
-                        new_capital, is_reinit=True)
-                if self.take_profit_manager:
-                    self.take_profit_manager.initialize_capital(
-                        new_capital, is_reinit=True)
-                if self.scalping_manager:
-                    self.scalping_manager.initialize_capital(
-                        new_capital, is_reinit=True)
-                self.logger.info(f"Capital reinitialized: ${new_capital:,.3f}")
+                isolated_capital = self.ensure_symbol_isolated_capital(
+                    current_price=current_price,
+                    is_reinit=True,
+                )
+                self.logger.info(f"Capital reinitialized: ${isolated_capital:,.3f}")
 
             self.logger.info("Fixed-range grid reset completed")
 
@@ -1642,6 +1653,178 @@ class GridCoordinator:
             self.logger.debug(f"Failed to read reserve amount: {e}")
 
         return Decimal('0')
+
+    def _resolve_symbol_reference_price(
+        self,
+        current_price: Optional[Decimal] = None,
+    ) -> Decimal:
+        """Return the best available price for symbol-isolated valuation."""
+        candidates = [current_price, self._symbol_reference_price]
+
+        state_price = getattr(self.state, "current_price", None)
+        if state_price is not None:
+            candidates.append(state_price)
+
+        if hasattr(self.tracker, "get_average_cost"):
+            try:
+                candidates.append(self.tracker.get_average_cost())
+            except Exception:
+                pass
+
+        state_average_cost = getattr(self.state, "average_cost", None)
+        if state_average_cost is not None:
+            candidates.append(state_average_cost)
+
+        try:
+            candidates.append(self.config.get_first_order_price())
+        except Exception:
+            pass
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                candidate_decimal = Decimal(str(candidate))
+            except Exception:
+                continue
+            if candidate_decimal > 0:
+                return candidate_decimal
+
+        return Decimal('0')
+
+    def _estimate_symbol_initial_capital(
+        self,
+        current_price: Optional[Decimal] = None,
+    ) -> Decimal:
+        """Estimate per-symbol strategy capital without using account equity."""
+        reference_price = self._resolve_symbol_reference_price(current_price)
+        if reference_price <= 0:
+            return Decimal('0')
+
+        estimated_capital = (
+            self.config.order_amount
+            * Decimal(str(self.config.grid_count))
+            * reference_price
+        )
+
+        reserve_amount = self._get_reserve_amount()
+        if reserve_amount > 0:
+            estimated_capital += abs(reserve_amount) * reference_price
+
+        return estimated_capital
+
+    def ensure_symbol_isolated_capital(
+        self,
+        current_price: Optional[Decimal] = None,
+        is_reinit: bool = False,
+    ) -> Decimal:
+        """Initialize or refresh the symbol-scoped capital baseline."""
+        if self._symbol_initial_capital > 0 and not is_reinit:
+            return self._symbol_initial_capital
+
+        reference_price = self._resolve_symbol_reference_price(current_price)
+        if reference_price <= 0:
+            return self._symbol_initial_capital
+
+        estimated_capital = self._estimate_symbol_initial_capital(reference_price)
+        if estimated_capital <= 0:
+            return self._symbol_initial_capital
+
+        self._symbol_reference_price = reference_price
+        self._symbol_initial_capital = estimated_capital
+
+        if self.capital_protection_manager:
+            self.capital_protection_manager.initialize_capital(
+                estimated_capital,
+                is_reinit=is_reinit,
+            )
+        if self.take_profit_manager:
+            self.take_profit_manager.initialize_capital(
+                estimated_capital,
+                is_reinit=is_reinit,
+            )
+        if self.scalping_manager:
+            self.scalping_manager.initialize_capital(
+                estimated_capital,
+                is_reinit=is_reinit,
+            )
+
+        return estimated_capital
+
+    def get_symbol_isolated_snapshot(
+        self,
+        current_price: Optional[Decimal] = None,
+    ) -> Dict[str, Decimal]:
+        """Return per-symbol equity and PnL metrics without cross-ticker noise."""
+        reference_price = self._resolve_symbol_reference_price(current_price)
+        initial_capital = self.ensure_symbol_isolated_capital(reference_price)
+        if initial_capital <= 0:
+            initial_capital = self._estimate_symbol_initial_capital(reference_price)
+
+        current_position = Decimal('0')
+        average_cost = Decimal('0')
+
+        if hasattr(self.tracker, "get_current_position"):
+            try:
+                current_position = self.tracker.get_current_position()
+            except Exception:
+                current_position = Decimal('0')
+        if hasattr(self.tracker, "get_average_cost"):
+            try:
+                average_cost = self.tracker.get_average_cost()
+            except Exception:
+                average_cost = Decimal('0')
+
+        if current_position == 0:
+            state_position = getattr(self.state, "current_position", None)
+            if state_position is not None:
+                current_position = Decimal(str(state_position))
+        if average_cost <= 0:
+            state_average_cost = getattr(self.state, "average_cost", None)
+            if state_average_cost is not None:
+                average_cost = Decimal(str(state_average_cost))
+
+        realized_profit = Decimal('0')
+        if hasattr(self.tracker, "get_realized_pnl"):
+            try:
+                realized_profit = self.tracker.get_realized_pnl()
+            except Exception:
+                realized_profit = Decimal('0')
+
+        total_fees = getattr(self.tracker, "total_fees", Decimal('0'))
+        try:
+            total_fees = Decimal(str(total_fees))
+        except Exception:
+            total_fees = Decimal('0')
+
+        if current_position != 0 and average_cost > 0 and reference_price > 0:
+            unrealized_profit = current_position * (reference_price - average_cost)
+        else:
+            unrealized_profit = Decimal('0')
+
+        net_profit = realized_profit + unrealized_profit - total_fees
+        current_equity = initial_capital + net_profit if initial_capital > 0 else net_profit
+        valuation_price = reference_price if reference_price > 0 else average_cost
+        position_value = abs(current_position) * valuation_price
+        profit_rate = (
+            (net_profit / initial_capital) * 100
+            if initial_capital > 0
+            else Decimal('0')
+        )
+
+        return {
+            "reference_price": reference_price,
+            "initial_capital": initial_capital,
+            "current_equity": current_equity,
+            "net_profit": net_profit,
+            "profit_rate": profit_rate,
+            "realized_profit": realized_profit,
+            "unrealized_profit": unrealized_profit,
+            "total_fees": total_fees,
+            "current_position": current_position,
+            "average_cost": average_cost,
+            "position_value": position_value,
+        }
 
     async def _place_take_profit_order(self):
         """

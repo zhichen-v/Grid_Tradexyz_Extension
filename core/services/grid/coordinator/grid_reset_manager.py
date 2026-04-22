@@ -297,12 +297,18 @@ class GridResetManager:
                 self.logger.info("📋 步骤 3/7: 获取新本金...")
                 try:
                     await self.coordinator.balance_monitor.update_balance()
-                    new_capital = self.coordinator.balance_monitor.collateral_balance
+                    current_price = await self.engine.get_current_price()
+                    new_capital = self.coordinator.ensure_symbol_isolated_capital(
+                        current_price=current_price,
+                        is_reinit=True,
+                    )
                     self.logger.info(
                         f"📊 {reset_type}后新本金: ${new_capital:,.3f}")
                 except Exception as e:
                     self.logger.error(f"⚠️ 获取平仓后余额失败: {e}")
-                    new_capital = self.coordinator.balance_monitor.collateral_balance  # 使用当前值
+                    new_capital = self.coordinator.ensure_symbol_isolated_capital(
+                        is_reinit=True,
+                    )
         else:
             self.logger.info("📋 步骤 2-3/7: 不平仓，跳过")
 
@@ -401,15 +407,6 @@ class GridResetManager:
 
         # ======== 步骤8: 重新初始化本金（如果需要）========
         if new_capital is not None and should_reinit_capital:
-            if self.coordinator.capital_protection_manager:
-                self.coordinator.capital_protection_manager.initialize_capital(
-                    new_capital, is_reinit=True)
-            if self.coordinator.take_profit_manager:
-                self.coordinator.take_profit_manager.initialize_capital(
-                    new_capital, is_reinit=True)
-            if self.coordinator.scalping_manager:
-                self.coordinator.scalping_manager.initialize_capital(
-                    new_capital, is_reinit=True)
             self.logger.info(f"💰 本金已重新初始化: ${new_capital:,.3f}")
 
         self.logger.info(

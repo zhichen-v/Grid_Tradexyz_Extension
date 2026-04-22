@@ -81,6 +81,7 @@ class GridStatistics:
     capital_protection_enabled: bool = False  # 是否启用本金保护
     capital_protection_active: bool = False   # 本金保护是否已激活
     initial_capital: Decimal = Decimal('0')   # 初始本金
+    strategy_equity: Decimal = Decimal('0')   # 当前单 symbol 策略权益
     capital_profit_loss: Decimal = Decimal('0')  # 本金盈亏
 
     # 价格脱离监控状态（价格移动网格专用）

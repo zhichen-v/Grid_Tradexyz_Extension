@@ -326,7 +326,11 @@ class GridTerminalUI:
             if stats.current_position == 0 and not open_orders:
                 return (None, 0.0, "N/A")
 
-            current_equity = stats.collateral_balance
+            current_equity = (
+                stats.strategy_equity
+                if stats.strategy_equity != 0
+                else stats.collateral_balance
+            )
             current_position = stats.current_position
             average_cost = stats.average_cost
             current_price = stats.current_price

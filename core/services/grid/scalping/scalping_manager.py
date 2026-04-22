@@ -44,7 +44,7 @@ class ScalpingManager:
 
         # 🔥 本金信息（用于计算精确止盈价格）
         self._initial_capital = Decimal('0')       # 初始本金
-        self._current_collateral = Decimal('0')    # 当前抵押品余额
+        self._current_equity = Decimal('0')        # 当前策略权益
 
         # 止盈订单
         self._take_profit_order: Optional[GridOrder] = None
@@ -163,7 +163,7 @@ class ScalpingManager:
         self._take_profit_grid_index = 0
         self.logger.info("⏸️  剥头皮模式已停用")
 
-    def update_position(self, position: Decimal, average_cost: Decimal, initial_capital: Decimal, current_collateral: Decimal):
+    def update_position(self, position: Decimal, average_cost: Decimal, initial_capital: Decimal, current_equity: Decimal):
         """
         更新持仓信息
 
@@ -171,13 +171,13 @@ class ScalpingManager:
             position: 当前持仓数量（正数=做多，负数=做空）
             average_cost: 平均持仓成本价（用于日志显示）
             initial_capital: 初始本金
-            current_collateral: 当前抵押品余额
+            current_equity: 当前策略权益
         """
         old_position = self._current_position
         self._current_position = position
         self._average_cost_price = average_cost
         self._initial_capital = initial_capital
-        self._current_collateral = current_collateral
+        self._current_equity = current_equity
 
         # 找到成本价对应的最接近的网格索引（保守）- 仅用于日志显示
         if average_cost > 0:
@@ -187,7 +187,7 @@ class ScalpingManager:
             )
 
             if old_position != position and self._is_scalping_active:
-                realized_pnl = current_collateral - initial_capital
+                realized_pnl = current_equity - initial_capital
                 self.logger.info(
                     f"📊 持仓更新: 数量{position}, 成本{average_cost}, "
                     f"成本网格第{self._cost_grid_index}格, "
@@ -225,7 +225,7 @@ class ScalpingManager:
             return None
 
         # 🔥 新算法：基于已实现盈亏计算回本价格
-        realized_pnl = self._current_collateral - self._initial_capital
+        realized_pnl = self._current_equity - self._initial_capital
         position_abs = abs(self._current_position)
 
         # 🔥 现货模式：计算回本价格时，需要将预留BTC也计入
@@ -329,7 +329,7 @@ class ScalpingManager:
         self.logger.info(
             f"💰 计算止盈订单（新算法）: "
             f"初始本金${self._initial_capital:.2f}, "
-            f"当前抵押品${self._current_collateral:.2f}, "
+            f"当前策略权益${self._current_equity:.2f}, "
             f"已实现盈亏{realized_pnl:+.2f}"
         )
         self.logger.info(
@@ -429,7 +429,7 @@ class ScalpingManager:
         self._average_cost_price = Decimal('0')
         self._cost_grid_index = 0
         self._initial_capital = Decimal('0')
-        self._current_collateral = Decimal('0')
+        self._current_equity = Decimal('0')
         self._take_profit_order = None
         self._take_profit_grid_index = 0
 

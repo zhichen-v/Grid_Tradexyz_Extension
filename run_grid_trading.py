@@ -5,32 +5,20 @@ Grid trading system startup script.
 Use this entrypoint to start the grid trading runtime directly.
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import logging
+import re
 import sys
 from decimal import Decimal
 from pathlib import Path
 
 import yaml
 
-from core.adapters.exchanges import ExchangeConfig, ExchangeFactory
-from core.adapters.exchanges.models import ExchangeType
 from core.logging import get_system_logger, initialize
 from core.logging.logger import LineLimitedFileHandler
-from core.services.grid.coordinator import GridCoordinator
-from core.services.grid.implementations import (
-    GridEngineImpl,
-    GridStrategyImpl,
-    PositionTrackerImpl,
-)
-from core.services.grid.models import GridConfig, GridState, GridType
-from core.services.grid.reserve import (
-    ReserveMonitor,
-    SpotReserveManager,
-    check_spot_reserve_on_startup,
-)
-from core.services.grid.terminal_ui import GridTerminalUI
 
 
 # Add the project root to the import path.
@@ -57,6 +45,15 @@ async def load_config(config_path: str) -> dict:
         raise
 
 
+def build_grid_log_dir(config_data: dict) -> str:
+    """Return the per-symbol log directory for one grid runtime."""
+    grid_config = config_data.get("grid_system", {})
+    raw_symbol = str(grid_config.get("symbol", "")).strip()
+    sanitized_symbol = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_symbol).strip("._-")
+    folder_name = sanitized_symbol or "default"
+    return str(Path("logs") / folder_name)
+
+
 def create_grid_config(config_data: dict) -> GridConfig:
     """
     Build the grid configuration object from raw config data.
@@ -67,6 +64,8 @@ def create_grid_config(config_data: dict) -> GridConfig:
     Returns:
         Grid configuration object.
     """
+    from core.services.grid.models import GridConfig, GridType
+
     grid_config = config_data["grid_system"]
     grid_type = GridType(grid_config["grid_type"])
 
@@ -184,6 +183,8 @@ def detect_market_type(symbol: str, exchange_name: str) -> ExchangeType:
     Returns:
         ExchangeType: Spot or perpetual market type.
     """
+    from core.adapters.exchanges.models import ExchangeType
+
     symbol_upper = symbol.upper()
     exchange_lower = exchange_name.lower()
 
@@ -244,6 +245,7 @@ async def create_exchange_adapter(config_data: dict):
         Connected exchange adapter.
     """
     import os
+    from core.adapters.exchanges import ExchangeConfig, ExchangeFactory
 
     grid_config = config_data["grid_system"]
     exchange_name = grid_config["exchange"].lower()
@@ -419,7 +421,18 @@ async def main(
         config_path: Configuration file path.
         debug: Whether to enable debug mode.
     """
-    initialize(clear_existing=True)
+    print("\nStep 1/6: Loading configuration...")
+    config_data = await load_config(config_path)
+    log_dir = build_grid_log_dir(config_data)
+    initialize(log_dir=log_dir, clear_existing=True)
+    from core.services.grid.coordinator import GridCoordinator
+    from core.services.grid.implementations import (
+        GridEngineImpl,
+        GridStrategyImpl,
+        PositionTrackerImpl,
+    )
+    from core.services.grid.models import GridState
+    from core.services.grid.terminal_ui import GridTerminalUI
 
     if debug:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -432,7 +445,7 @@ async def main(
         )
         lighter_ws_logger.setLevel(logging.DEBUG)
 
-        exchange_log_path = Path("logs/ExchangeAdapter.log").resolve()
+        exchange_log_path = (Path(log_dir) / "ExchangeAdapter.log").resolve()
         has_exchange_log_handler = any(
             isinstance(handler, logging.FileHandler)
             and Path(getattr(handler, "baseFilename", "")).resolve() == exchange_log_path
@@ -465,16 +478,16 @@ async def main(
         print("=" * 70)
 
     logger = get_system_logger()
+    from core.adapters.exchanges.models import ExchangeType
 
     try:
         # 1. Load configuration.
-        print("\nStep 1/6: Loading configuration...")
-        config_data = await load_config(config_path)
         grid_config = create_grid_config(config_data)
         print("Configuration loaded successfully")
         print(f"   - Exchange: {grid_config.exchange}")
         print(f"   - Symbol: {grid_config.symbol}")
         print(f"   - Grid type: {grid_config.grid_type.value}")
+        print(f"   - Log directory: {Path(log_dir)}")
 
         # Spot markets support only long-side grid modes.
         symbol = grid_config.symbol
@@ -545,6 +558,12 @@ async def main(
         reserve_monitor = None
 
         if exchange_adapter.config.exchange_type == ExchangeType.SPOT:
+            from core.services.grid.reserve import (
+                ReserveMonitor,
+                SpotReserveManager,
+                check_spot_reserve_on_startup,
+            )
+
             spot_reserve_config = getattr(grid_config, "spot_reserve", None)
 
             if spot_reserve_config and spot_reserve_config.get("enabled", False):

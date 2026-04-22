@@ -182,10 +182,14 @@ class ScalpingOperations:
         self.logger.info("💰 激活剥头皮前强制更新余额...")
         await self.coordinator.balance_monitor.update_balance()
 
-        initial_capital = self.scalping_manager.get_initial_capital()
+        symbol_snapshot = self.coordinator.get_symbol_isolated_snapshot(
+            current_price=average_cost
+        )
         self.scalping_manager.update_position(
-            current_position, average_cost, initial_capital,
-            self.coordinator.balance_monitor.collateral_balance
+            current_position,
+            average_cost,
+            symbol_snapshot["initial_capital"],
+            symbol_snapshot["current_equity"],
         )
 
         # 4. 挂止盈订单（带验证）
@@ -322,19 +326,12 @@ class ScalpingOperations:
                 # 重置完成后，获取最新余额作为新本金
                 try:
                     await self.coordinator.balance_monitor.update_balance()
-                    new_capital = self.coordinator.balance_monitor.collateral_balance
+                    current_price = await self.engine.get_current_price()
+                    new_capital = self.coordinator.ensure_symbol_isolated_capital(
+                        current_price=current_price,
+                        is_reinit=True,
+                    )
                     self.logger.info(f"📊 重置后最新本金: ${new_capital:,.3f}")
-
-                    # 重新初始化所有管理器的本金
-                    if self.coordinator.capital_protection_manager:
-                        self.coordinator.capital_protection_manager.initialize_capital(
-                            new_capital, is_reinit=True)
-                    if self.coordinator.take_profit_manager:
-                        self.coordinator.take_profit_manager.initialize_capital(
-                            new_capital, is_reinit=True)
-                    if self.scalping_manager:
-                        self.scalping_manager.initialize_capital(
-                            new_capital, is_reinit=True)
 
                     self.logger.info(f"💰 所有管理器本金已更新为最新余额: ${new_capital:,.3f}")
                 except Exception as e:
@@ -445,12 +442,14 @@ class ScalpingOperations:
             )
 
             # 🔥 2. 更新ScalpingManager的持仓（确保一致）
-            initial_capital = self.scalping_manager.get_initial_capital()
+            symbol_snapshot = self.coordinator.get_symbol_isolated_snapshot(
+                current_price=tracker_cost
+            )
             self.scalping_manager.update_position(
                 tracker_position,
                 tracker_cost,
-                initial_capital,
-                self.coordinator.balance_monitor.collateral_balance
+                symbol_snapshot["initial_capital"],
+                symbol_snapshot["current_equity"],
             )
 
             # 3. 获取当前价格

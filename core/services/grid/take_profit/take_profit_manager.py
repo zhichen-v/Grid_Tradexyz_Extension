@@ -76,12 +76,12 @@ class TakeProfitManager:
         """获取初始本金"""
         return self._initial_capital
 
-    def check_take_profit_condition(self, current_collateral: Decimal) -> bool:
+    def check_take_profit_condition(self, current_equity: Decimal) -> bool:
         """
         检查是否满足止盈条件
 
         Args:
-            current_collateral: 当前抵押品余额
+            current_equity: 当前策略权益
 
         Returns:
             True表示满足止盈条件
@@ -99,7 +99,7 @@ class TakeProfitManager:
             return False
 
         # 计算盈利金额和盈利率
-        profit = current_collateral - self._initial_capital
+        profit = current_equity - self._initial_capital
         profit_rate = profit / \
             self._initial_capital if self._initial_capital > 0 else Decimal(
                 '0')
@@ -110,7 +110,7 @@ class TakeProfitManager:
         if should_take_profit:
             self.logger.warning(
                 f"🎯 触发止盈条件！"
-                f"当前抵押品=${current_collateral:,.3f}, "
+                f"当前权益=${current_equity:,.3f}, "
                 f"初始本金=${self._initial_capital:,.3f}, "
                 f"盈利=${profit:+,.3f} ({float(profit_rate * 100):+.2f}%), "
                 f"阈值={float(self._take_profit_threshold * 100):.2f}%"
@@ -118,17 +118,17 @@ class TakeProfitManager:
 
         return should_take_profit
 
-    def activate(self, current_collateral: Decimal):
+    def activate(self, current_equity: Decimal):
         """
         激活止盈模式
 
         Args:
-            current_collateral: 当前抵押品余额
+            current_equity: 当前策略权益
         """
         self._is_active = True
         self._activation_time = datetime.now()
 
-        profit = current_collateral - self._initial_capital
+        profit = current_equity - self._initial_capital
         profit_rate = profit / \
             self._initial_capital if self._initial_capital > 0 else Decimal(
                 '0')
@@ -136,7 +136,7 @@ class TakeProfitManager:
         self.logger.warning(
             f"💰 止盈模式已激活！"
             f"初始本金=${self._initial_capital:,.3f}, "
-            f"当前抵押品=${current_collateral:,.3f}, "
+            f"当前权益=${current_equity:,.3f}, "
             f"盈利=${profit:+,.3f} ({float(profit_rate * 100):+.2f}%)"
         )
 
@@ -144,46 +144,46 @@ class TakeProfitManager:
         """判断止盈模式是否已激活"""
         return self._is_active
 
-    def get_profit_amount(self, current_collateral: Decimal) -> Decimal:
+    def get_profit_amount(self, current_equity: Decimal) -> Decimal:
         """
         获取盈利金额
 
         Args:
-            current_collateral: 当前抵押品余额
+            current_equity: 当前策略权益
 
         Returns:
             盈利金额（正数为盈利，负数为亏损）
         """
         if self._initial_capital == Decimal('0'):
             return Decimal('0')
-        return current_collateral - self._initial_capital
+        return current_equity - self._initial_capital
 
-    def get_profit_rate(self, current_collateral: Decimal) -> Decimal:
+    def get_profit_rate(self, current_equity: Decimal) -> Decimal:
         """
         获取盈利率
 
         Args:
-            current_collateral: 当前抵押品余额
+            current_equity: 当前策略权益
 
         Returns:
             盈利率（小数形式，如0.01表示1%）
         """
         if self._initial_capital == Decimal('0'):
             return Decimal('0')
-        profit = current_collateral - self._initial_capital
+        profit = current_equity - self._initial_capital
         return profit / self._initial_capital
 
-    def get_profit_percentage(self, current_collateral: Decimal) -> Decimal:
+    def get_profit_percentage(self, current_equity: Decimal) -> Decimal:
         """
         获取盈利百分比
 
         Args:
-            current_collateral: 当前抵押品余额
+            current_equity: 当前策略权益
 
         Returns:
             盈利百分比（如1.5表示1.5%）
         """
-        return self.get_profit_rate(current_collateral) * 100
+        return self.get_profit_rate(current_equity) * 100
 
     def reset(self):
         """重置止盈状态（网格重置后调用）"""
@@ -191,24 +191,24 @@ class TakeProfitManager:
         self._activation_time = None
         self.logger.info("🔄 止盈状态已重置")
 
-    def get_status_summary(self, current_collateral: Decimal) -> dict:
+    def get_status_summary(self, current_equity: Decimal) -> dict:
         """
         获取状态摘要（用于UI显示）
 
         Args:
-            current_collateral: 当前抵押品余额
+            current_equity: 当前策略权益
 
         Returns:
             状态摘要字典
         """
-        profit_amount = self.get_profit_amount(current_collateral)
-        profit_rate = self.get_profit_rate(current_collateral)
+        profit_amount = self.get_profit_amount(current_equity)
+        profit_rate = self.get_profit_rate(current_equity)
 
         return {
             'enabled': True,
             'active': self._is_active,
             'initial_capital': float(self._initial_capital),
-            'current_collateral': float(current_collateral),
+            'current_equity': float(current_equity),
             'profit_amount': float(profit_amount),
             'profit_rate': float(profit_rate * 100),  # 转为百分比
             # 转为百分比

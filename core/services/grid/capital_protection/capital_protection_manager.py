@@ -133,12 +133,12 @@ class CapitalProtectionManager:
             f"初始本金: ${self._initial_capital:,.2f}"
         )
 
-    def check_capital_recovery(self, current_collateral: Decimal) -> bool:
+    def check_capital_recovery(self, current_equity: Decimal) -> bool:
         """
         检查抵押品是否回本
 
         Args:
-            current_collateral: 当前抵押品余额
+            current_equity: 当前策略权益
 
         Returns:
             True表示已回本（抵押品>=本金，允许$0.01的容差）
@@ -147,7 +147,7 @@ class CapitalProtectionManager:
             self.logger.warning("⚠️ 初始本金未设置，无法检查回本")
             return False
 
-        profit_loss = current_collateral - self._initial_capital
+        profit_loss = current_equity - self._initial_capital
         profit_rate = (profit_loss / self._initial_capital *
                        100) if self._initial_capital > 0 else Decimal('0')
 
@@ -159,14 +159,14 @@ class CapitalProtectionManager:
         if is_recovered:
             self.logger.warning(
                 f"✅ 抵押品已回本（容差±$0.01）！"
-                f"当前: ${current_collateral:,.3f}, "
+                f"当前: ${current_equity:,.3f}, "
                 f"本金: ${self._initial_capital:,.3f}, "
                 f"盈亏: ${profit_loss:+,.3f} ({profit_rate:+.3f}%)"
             )
         else:
             self.logger.info(
                 f"⏳ 等待回本... "
-                f"当前: ${current_collateral:,.3f}, "
+                f"当前: ${current_equity:,.3f}, "
                 f"本金: ${self._initial_capital:,.3f}, "
                 f"亏损: ${profit_loss:,.3f} ({profit_rate:.3f}%)"
             )
@@ -177,41 +177,41 @@ class CapitalProtectionManager:
         """判断本金保护是否已激活"""
         return self._is_active
 
-    def get_profit_loss(self, current_collateral: Decimal) -> Decimal:
+    def get_profit_loss(self, current_equity: Decimal) -> Decimal:
         """
         获取盈亏金额
 
         Args:
-            current_collateral: 当前抵押品余额
+            current_equity: 当前策略权益
 
         Returns:
             盈亏金额（正数为盈利，负数为亏损）
         """
         if self._initial_capital == Decimal('0'):
             return Decimal('0')
-        return current_collateral - self._initial_capital
+        return current_equity - self._initial_capital
 
-    def get_profit_loss_rate(self, current_collateral: Decimal) -> Decimal:
+    def get_profit_loss_rate(self, current_equity: Decimal) -> Decimal:
         """
         获取盈亏率
 
         Args:
-            current_collateral: 当前抵押品余额
+            current_equity: 当前策略权益
 
         Returns:
             盈亏率（百分比）
         """
         if self._initial_capital == Decimal('0'):
             return Decimal('0')
-        profit_loss = current_collateral - self._initial_capital
+        profit_loss = current_equity - self._initial_capital
         return (profit_loss / self._initial_capital * 100)
 
-    def get_status_summary(self, current_collateral: Decimal) -> dict:
+    def get_status_summary(self, current_equity: Decimal) -> dict:
         """
         获取状态摘要（用于UI显示）
 
         Args:
-            current_collateral: 当前抵押品余额
+            current_equity: 当前策略权益
 
         Returns:
             状态摘要字典
@@ -220,9 +220,9 @@ class CapitalProtectionManager:
             'enabled': True,
             'active': self._is_active,
             'initial_capital': float(self._initial_capital),
-            'current_collateral': float(current_collateral),
-            'profit_loss': float(self.get_profit_loss(current_collateral)),
-            'profit_loss_rate': float(self.get_profit_loss_rate(current_collateral)),
+            'current_equity': float(current_equity),
+            'profit_loss': float(self.get_profit_loss(current_equity)),
+            'profit_loss_rate': float(self.get_profit_loss_rate(current_equity)),
             'trigger_percent': self.config.capital_protection_trigger_percent,
             'trigger_grid': self._trigger_grid_index,
             'activation_time': self._activation_time.isoformat() if self._activation_time else None
