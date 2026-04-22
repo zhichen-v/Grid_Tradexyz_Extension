@@ -207,7 +207,19 @@ class OrderHealthChecker:
                 effective_fill = min(filled_amount, order_amount) if order_amount > 0 else filled_amount
                 if order_amount > 0 and effective_fill < (order_amount - tolerance):
                     self._clear_missing_order_tracking(alias_keys)
-                    self._record_partial_fill_snapshot(grid_order, filled_price, effective_fill)
+                    fills = []
+                    raw_data = getattr(exchange_order, "raw_data", {}) or {}
+                    if isinstance(raw_data, dict):
+                        raw_fills = raw_data.get("fills")
+                        if isinstance(raw_fills, list):
+                            fills = [fill for fill in raw_fills if isinstance(fill, dict)]
+
+                    self._record_partial_fill_snapshot(
+                        grid_order,
+                        filled_price,
+                        effective_fill,
+                        fills=fills,
+                    )
                     continue
 
                 if order_amount > 0 and abs(order_amount - effective_fill) <= tolerance:
@@ -744,7 +756,9 @@ class OrderHealthChecker:
         self,
         grid_order: GridOrder,
         filled_price: Decimal,
-        filled_amount: Decimal,
+        filled_amount: Decimal,
+
+        fills: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Store a conservative partial-fill snapshot so health checks do not over-repair it."""
         if not isinstance(getattr(grid_order, "exchange_data", None), dict):
@@ -771,7 +785,142 @@ class OrderHealthChecker:
             f"cumulative={normalized_fill}, order_amount={order_amount}, order_id={grid_order.order_id}"
         )
 
-    def _describe_key_diff(
+    def _record_partial_fill_snapshot(
+        self,
+        grid_order: GridOrder,
+        filled_price: Decimal,
+        filled_amount: Decimal,
+        fills: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Store a conservative partial-fill snapshot so health checks do not over-repair it."""
+        order_amount = self._decimal_or_zero(getattr(grid_order, "amount", Decimal("0")))
+        tracking = self._get_tradexyz_fill_tracking(grid_order)
+        previous_amount = self._decimal_or_zero(tracking.get("cumulative_filled"))
+        recorded_from_snapshot = False
+        snapshot_fill_count = 0
+        if fills:
+            for fill in fills:
+                fill_price = self._decimal_or_zero(
+                    fill.get("px") or fill.get("avgPx") or fill.get("price")
+                )
+                fill_size = self._decimal_or_zero(
+                    fill.get("sz") or fill.get("filledSz") or fill.get("filled")
+                )
+                if fill_size <= 0:
+                    continue
+                event_key = self._build_tradexyz_fill_event_key(
+                    fill,
+                    grid_order,
+                    fill_price if fill_price > 0 else filled_price,
+                    fill_size,
+                )
+                if self._record_tradexyz_fill_entry(
+                    tracking,
+                    event_key,
+                    fill_size,
+                    fill_price if fill_price > 0 else filled_price,
+                ):
+                    recorded_from_snapshot = True
+                snapshot_fill_count += 1
+
+        normalized_fill = self._decimal_or_zero(tracking.get("cumulative_filled"))
+        snapshot_fill = min(filled_amount, order_amount) if order_amount > 0 else filled_amount
+        if snapshot_fill > normalized_fill:
+            tracking["cumulative_filled"] = str(snapshot_fill)
+            tracking["last_fill_price"] = str(filled_price)
+            normalized_fill = snapshot_fill
+            recorded_from_snapshot = True
+
+        if normalized_fill <= previous_amount:
+            return
+
+        tracking["remaining_amount"] = str(max(order_amount - normalized_fill, Decimal("0")))
+        self.logger.info(
+            "Recorded partial fill snapshot from health-check: "
+            f"grid_id={grid_order.grid_id}, side={grid_order.side.value}, "
+            f"cumulative={normalized_fill}, order_amount={order_amount}, "
+            f"snapshot_fills={snapshot_fill_count}, ledger_updated={recorded_from_snapshot}, "
+            f"order_id={grid_order.order_id}"
+        )
+
+    def _get_tradexyz_fill_tracking(self, grid_order: GridOrder) -> Dict[str, Any]:
+        """Return mutable TradeXYZ fill tracking shared with the engine."""
+        if not isinstance(getattr(grid_order, "exchange_data", None), dict):
+            grid_order.exchange_data = {}
+
+        tracking = grid_order.exchange_data.get("tradexyz_fill_tracking")
+        if not isinstance(tracking, dict):
+            tracking = {}
+            grid_order.exchange_data["tradexyz_fill_tracking"] = tracking
+
+        if not isinstance(tracking.get("seen_fill_ids"), list):
+            tracking["seen_fill_ids"] = []
+        if not isinstance(tracking.get("fills_by_id"), dict):
+            tracking["fills_by_id"] = {}
+        return tracking
+
+    def _record_tradexyz_fill_entry(
+        self,
+        tracking: Dict[str, Any],
+        event_key: str,
+        fill_amount: Decimal,
+        filled_price: Decimal,
+    ) -> bool:
+        """Record one unique fill into the shared TradeXYZ ledger."""
+        fills_by_id = tracking.setdefault("fills_by_id", {})
+        seen_fill_ids = tracking.setdefault("seen_fill_ids", [])
+        if event_key in fills_by_id:
+            return False
+
+        fills_by_id[event_key] = {
+            "amount": format(fill_amount.normalize(), "f"),
+            "price": format(filled_price.normalize(), "f"),
+        }
+        seen_fill_ids.append(event_key)
+        if len(seen_fill_ids) > 200:
+            stale_keys = seen_fill_ids[:-200]
+            del seen_fill_ids[:-200]
+            for stale_key in stale_keys:
+                if stale_key not in seen_fill_ids:
+                    fills_by_id.pop(stale_key, None)
+
+        cumulative_filled = Decimal("0")
+        for fill_info in fills_by_id.values():
+            cumulative_filled += self._decimal_or_zero(fill_info.get("amount"))
+        tracking["cumulative_filled"] = str(cumulative_filled)
+        tracking["last_fill_price"] = str(filled_price)
+        return True
+
+    def _build_tradexyz_fill_event_key(
+        self,
+        item: Dict[str, Any],
+        grid_order: GridOrder,
+        filled_price: Decimal,
+        fill_amount: Decimal,
+    ) -> str:
+        """Build the shared fill key used by websocket and health-check paths."""
+        explicit_id = (
+            item.get("tid")
+            or item.get("fillId")
+            or item.get("fill_id")
+            or item.get("tradeId")
+            or item.get("hash")
+            or item.get("txHash")
+        )
+        if explicit_id is not None:
+            return str(explicit_id)
+
+        event_time = item.get("time") or item.get("timestamp") or ""
+        side = item.get("side") or grid_order.side.value
+        start_position = item.get("startPosition") or item.get("start_pos") or ""
+        direction = item.get("dir") or item.get("direction") or ""
+        fee = item.get("fee") or item.get("commission") or ""
+        return (
+            f"{grid_order.order_id}:{event_time}:{side}:{start_position}:{direction}:{fee}:"
+            f"{format(filled_price.normalize(), 'f')}:{format(fill_amount.normalize(), 'f')}"
+        )
+
+    def _describe_key_diff(
         self,
         label: str,
         left: set[Tuple[object, str]],

@@ -1080,22 +1080,22 @@ class GridEngineImpl(IGridEngine):
             filled_price,
             fill_amount,
         )
-        seen_event_keys = tracking.setdefault("seen_event_keys", [])
-        if event_key in seen_event_keys:
+        if not self._record_tradexyz_fill_entry(
+            tracking,
+            event_key,
+            fill_amount,
+            filled_price,
+        ):
             self.logger.debug(
                 f"Skipping duplicate TradeXYZ user fill: "
                 f"grid_id={grid_order.grid_id}, order_id={grid_order.order_id}, event={event_key}"
             )
             return True
 
-        seen_event_keys.append(event_key)
-        if len(seen_event_keys) > 20:
-            del seen_event_keys[:-20]
-
         cumulative_filled = self._safe_decimal(
             tracking.get("cumulative_filled"),
             Decimal("0"),
-        ) + fill_amount
+        )
         order_amount = grid_order.amount or Decimal("0")
         tolerance = self._get_order_fill_tolerance()
 
@@ -1435,7 +1435,45 @@ class GridEngineImpl(IGridEngine):
         if not isinstance(tracking, dict):
             tracking = {}
             grid_order.exchange_data["tradexyz_fill_tracking"] = tracking
+        if not isinstance(tracking.get("seen_fill_ids"), list):
+            tracking["seen_fill_ids"] = []
+        if not isinstance(tracking.get("fills_by_id"), dict):
+            tracking["fills_by_id"] = {}
         return tracking
+
+    def _record_tradexyz_fill_entry(
+        self,
+        tracking: Dict[str, Any],
+        event_key: str,
+        fill_amount: Decimal,
+        filled_price: Decimal,
+    ) -> bool:
+        """Record one unique TradeXYZ fill into the shared ledger."""
+        fills_by_id = tracking.setdefault("fills_by_id", {})
+        seen_fill_ids = tracking.setdefault("seen_fill_ids", [])
+        if event_key in fills_by_id:
+            return False
+
+        normalized_amount = format(fill_amount.normalize(), "f")
+        normalized_price = format(filled_price.normalize(), "f")
+        fills_by_id[event_key] = {
+            "amount": normalized_amount,
+            "price": normalized_price,
+        }
+        seen_fill_ids.append(event_key)
+        if len(seen_fill_ids) > 200:
+            stale_keys = seen_fill_ids[:-200]
+            del seen_fill_ids[:-200]
+            for stale_key in stale_keys:
+                if stale_key not in seen_fill_ids:
+                    fills_by_id.pop(stale_key, None)
+
+        cumulative_filled = Decimal("0")
+        for fill_info in fills_by_id.values():
+            cumulative_filled += self._safe_decimal(fill_info.get("amount"), Decimal("0"))
+        tracking["cumulative_filled"] = str(cumulative_filled)
+        tracking["last_fill_price"] = normalized_price
+        return True
 
     def _build_tradexyz_fill_event_key(
         self,
@@ -1458,10 +1496,13 @@ class GridEngineImpl(IGridEngine):
 
         event_time = item.get("time") or item.get("timestamp") or ""
         side = item.get("side") or grid_order.side.value
+        start_position = item.get("startPosition") or item.get("start_pos") or ""
+        direction = item.get("dir") or item.get("direction") or ""
+        fee = item.get("fee") or item.get("commission") or ""
         normalized_price = format(filled_price.normalize(), "f")
         normalized_amount = format(fill_amount.normalize(), "f")
         return (
-            f"{grid_order.order_id}:{event_time}:{side}:"
+            f"{grid_order.order_id}:{event_time}:{side}:{start_position}:{direction}:{fee}:"
             f"{normalized_price}:{normalized_amount}"
         )
 
