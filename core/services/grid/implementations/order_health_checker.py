@@ -30,6 +30,8 @@ class OrderHealthChecker:
     """Keep exchange orders, local cache, and exposure aligned."""
 
     RECENT_FILL_COOLDOWN_SECONDS = 15
+    TP_ONLY_MISMATCH_WARNING_CYCLES = 4
+    TP_ONLY_MISMATCH_WARNING_SECONDS = 60.0
 
     def __init__(self, config: GridConfig, engine, reserve_manager=None):
         self.config = config
@@ -48,6 +50,8 @@ class OrderHealthChecker:
         self._health_summary_log_key: Optional[str] = None
         self._health_summary_log_time = 0.0
         self._position_repair_skip_logged = False
+        self._tp_only_mismatch_cycles = 0
+        self._tp_only_mismatch_started_at = 0.0
 
         # Reuse the shared line-limited handler and keep file output at INFO.
         self.logger.logger.setLevel(logging.INFO)
@@ -686,6 +690,7 @@ class OrderHealthChecker:
         tolerance = self._position_tolerance()
 
         if deferred:
+            self._reset_tp_only_mismatch_tracking()
             self._log_runtime_consistency_message(
                 "info",
                 "Runtime consistency check deferred: "
@@ -695,9 +700,9 @@ class OrderHealthChecker:
             )
             return
 
-        issues: List[str] = []
+        structural_issues: List[str] = []
         if exchange_price_keys != engine_price_keys:
-            issues.append(
+            structural_issues.append(
                 self._describe_key_diff(
                     label="engine_vs_exchange",
                     left=engine_price_keys,
@@ -705,7 +710,7 @@ class OrderHealthChecker:
                 )
             )
         if exchange_price_keys != state_price_keys:
-            issues.append(
+            structural_issues.append(
                 self._describe_key_diff(
                     label="state_vs_exchange",
                     left=state_price_keys,
@@ -713,11 +718,11 @@ class OrderHealthChecker:
                 )
             )
         if abs(tracker_position - actual_position) > tolerance:
-            issues.append(
+            structural_issues.append(
                 f"tracker_position={tracker_position} != exchange_position={actual_position}"
             )
         if abs(state_position - actual_position) > tolerance:
-            issues.append(
+            structural_issues.append(
                 f"state_position={state_position} != exchange_position={actual_position}"
             )
 
@@ -725,19 +730,36 @@ class OrderHealthChecker:
         expected_tp_amount = self._get_expected_take_profit_amount(actual_position)
         partial_tp_gap_allowance = self._get_pending_partial_base_fill_exposure()
         tp_gap = abs(tp_open_amount - expected_tp_amount)
+        tp_issue: Optional[str] = None
         if tp_gap > (tolerance + partial_tp_gap_allowance):
-            issues.append(
+            tp_issue = (
                 f"take_profit_coverage={tp_open_amount} != expected_take_profit={expected_tp_amount} "
                 f"(partial_fill_allowance={partial_tp_gap_allowance})"
             )
 
-        if issues:
+        if structural_issues:
+            self._reset_tp_only_mismatch_tracking()
+            if tp_issue:
+                structural_issues.append(tp_issue)
             self._log_runtime_consistency_message(
                 "warning",
-                "Runtime consistency issue detected: " + "; ".join(issues),
+                "Runtime consistency issue detected: " + "; ".join(structural_issues),
             )
             return
 
+        if tp_issue:
+            level, prefix = self._classify_tp_only_mismatch_log_level()
+            self._log_runtime_consistency_message(
+                level,
+                prefix
+                + f"exchange_orders={len(exchange_keys)}, engine_orders={len(engine_keys)}, "
+                f"state_orders={len(state_keys)}, exchange_position={actual_position}, "
+                f"tracker_position={tracker_position}, state_position={state_position}; "
+                + tp_issue,
+            )
+            return
+
+        self._reset_tp_only_mismatch_tracking()
         self._log_runtime_consistency_message(
             "info",
             "Runtime consistency verified: "
@@ -1351,6 +1373,35 @@ class OrderHealthChecker:
         if not tp_order:
             return None
         return getattr(tp_order, "order_id", None)
+
+    def _classify_tp_only_mismatch_log_level(self) -> Tuple[str, str]:
+        """Downgrade isolated TP-coverage mismatches unless they persist for multiple cycles."""
+        now = time.time()
+        if self._tp_only_mismatch_cycles == 0:
+            self._tp_only_mismatch_started_at = now
+        self._tp_only_mismatch_cycles += 1
+        mismatch_age = max(0.0, now - self._tp_only_mismatch_started_at)
+
+        if (
+            self._tp_only_mismatch_cycles >= self.TP_ONLY_MISMATCH_WARNING_CYCLES
+            and mismatch_age >= self.TP_ONLY_MISMATCH_WARNING_SECONDS
+        ):
+            return (
+                "warning",
+                "Runtime consistency issue detected: persistent isolated TP-coverage mismatch "
+                f"(cycles={self._tp_only_mismatch_cycles}, age={int(mismatch_age)}s): ",
+            )
+
+        return (
+            "info",
+            "Runtime consistency note: isolated TP-coverage mismatch while order and position "
+            f"sources remain aligned (cycles={self._tp_only_mismatch_cycles}, age={int(mismatch_age)}s): ",
+        )
+
+    def _reset_tp_only_mismatch_tracking(self) -> None:
+        """Clear isolated TP-mismatch tracking after the runtime state converges or changes class."""
+        self._tp_only_mismatch_cycles = 0
+        self._tp_only_mismatch_started_at = 0.0
 
     def _get_pending_partial_base_fill_exposure(self) -> Decimal:
         """Return live exposure caused by partial base fills that should not yet have TP coverage."""
