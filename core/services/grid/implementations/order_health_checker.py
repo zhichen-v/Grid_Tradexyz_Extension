@@ -9,7 +9,7 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ....adapters.exchanges import OrderSide as ExchangeOrderSide
 from ....adapters.exchanges import OrderType, PositionSide
@@ -37,9 +37,11 @@ class OrderHealthChecker:
         self.reserve_manager = reserve_manager
         self.logger = get_logger(__name__)
         self._missing_order_seen_at: Dict[str, float] = {}
+        self._missing_grid_seen_at: Dict[Tuple[str, str], float] = {}
         self._missing_order_resolution_timeout = float(
             getattr(self.engine, "_missing_order_resolution_timeout", 20.0)
         )
+        self._last_unresolved_order_price_keys: set[Tuple[str, str]] = set()
         self._restored_missing_orders_in_sync = 0
         self._runtime_consistency_log_key: Optional[Tuple[str, str]] = None
         self._runtime_consistency_log_time = 0.0
@@ -74,6 +76,9 @@ class OrderHealthChecker:
                 current_price = await self.engine.get_current_price()
                 cleanup_count = await self._cleanup_duplicate_orders(exchange_orders)
                 repair_count += cleanup_count
+                if cleanup_count:
+                    exchange_orders, positions = await self._fetch_orders_and_positions()
+                    unresolved_orders = await self._sync_orders_into_engine(exchange_orders)
 
                 if self._restored_missing_orders_in_sync:
                     consistency_deferred = True
@@ -81,26 +86,52 @@ class OrderHealthChecker:
                         "Skip gap repair and position repair because missing orders were "
                         f"already restored in this health-check cycle: restored={self._restored_missing_orders_in_sync}"
                     )
-                elif unresolved_orders:
-                    consistency_deferred = True
-                    self.logger.info(
-                        "Skip gap repair and position repair because some missing orders "
-                        f"still have unresolved final status: count={unresolved_orders}"
-                    )
                 else:
                     missing_orders = self._build_missing_orders(exchange_orders, current_price)
-                    if missing_orders:
-                        if self._has_recent_fill():
+                    blocked_missing_orders, repairable_missing_orders = (
+                        self._split_missing_orders_by_unresolved(missing_orders)
+                    )
+                    if blocked_missing_orders:
+                        consistency_deferred = True
+                        self.logger.info(
+                            "Defer overlapping gap repairs because some missing orders still "
+                            "have unresolved final status: "
+                            f"blocked={len(blocked_missing_orders)}, unresolved={unresolved_orders}, "
+                            f"keys={self._summarize_order_price_keys(blocked_missing_orders)}"
+                        )
+                    if repairable_missing_orders:
+                        if self._should_delay_gap_repair_for_recent_fill(
+                            repairable_missing_orders,
+                            cleanup_count,
+                        ):
                             self.logger.info(
                                 f"Skip gap repair because a fill happened within the last "
                                 f"{self.RECENT_FILL_COOLDOWN_SECONDS} seconds"
                             )
                         else:
-                            placed_count = await self._place_missing_orders(missing_orders)
+                            if cleanup_count and self._has_recent_fill():
+                                self.logger.info(
+                                    "Bypass recent-fill cooldown for gap repair because this "
+                                    f"cycle already removed duplicate orders: repaired={len(repairable_missing_orders)}"
+                                )
+                            elif self._has_persistent_missing_orders(repairable_missing_orders):
+                                self.logger.info(
+                                    "Bypass recent-fill cooldown for persistent missing grid orders: "
+                                    f"repaired={len(repairable_missing_orders)}, "
+                                    f"keys={self._summarize_order_price_keys(repairable_missing_orders)}"
+                                )
+
+                            placed_count = await self._place_missing_orders(repairable_missing_orders)
                             repair_count += placed_count
                             if placed_count:
                                 exchange_orders, positions = await self._fetch_orders_and_positions()
                                 unresolved_orders = await self._sync_orders_into_engine(exchange_orders)
+                    elif unresolved_orders:
+                        consistency_deferred = True
+                        self.logger.info(
+                            "Skip gap repair and position repair because some missing orders "
+                            f"still have unresolved final status: count={unresolved_orders}"
+                        )
 
                     if not unresolved_orders and self._should_repair_position():
                         position_result = self._check_position_health(exchange_orders, positions)
@@ -165,6 +196,7 @@ class OrderHealthChecker:
         exchange_order_ids = {order.id for order in exchange_orders if getattr(order, "id", None)}
         filled_orders: List[GridOrder] = []
         unresolved_orders = 0
+        unresolved_price_keys: set[Tuple[str, str]] = set()
 
         for grid_order in list(self.engine.get_pending_orders()):
             alias_keys = self._pending_keys_for_order(grid_order)
@@ -195,6 +227,7 @@ class OrderHealthChecker:
                 if await self._restore_missing_order_if_timed_out(grid_order, alias_keys):
                     continue
                 unresolved_orders += 1
+                unresolved_price_keys.add(self._order_price_key(grid_order))
                 continue
 
             status = exchange_order.status.value.lower() if exchange_order.status else "unknown"
@@ -243,6 +276,7 @@ class OrderHealthChecker:
                 if await self._restore_missing_order_if_timed_out(grid_order, alias_keys):
                     continue
                 unresolved_orders += 1
+                unresolved_price_keys.add(self._order_price_key(grid_order))
 
         for grid_order in filled_orders:
             for callback in self.engine._order_callbacks:
@@ -273,6 +307,7 @@ class OrderHealthChecker:
             except Exception as exc:
                 self.logger.warning(f"Failed to mirror exchange order into local cache: {exc}")
 
+        self._last_unresolved_order_price_keys = unresolved_price_keys
         return unresolved_orders
 
     async def _cleanup_duplicate_orders(self, exchange_orders: List[OrderData]) -> int:
@@ -308,7 +343,8 @@ class OrderHealthChecker:
 
     def _find_duplicate_orders(self, exchange_orders: List[OrderData]) -> List[OrderData]:
         """Return duplicate orders after grouping by exact price and side."""
-        seen: Dict[Tuple[str, str], OrderData] = {}
+        grouped: Dict[Tuple[str, str], List[OrderData]] = {}
+        local_order_ids_by_key = self._get_local_pending_order_ids_by_price_key()
         duplicates: List[OrderData] = []
 
         for order in exchange_orders:
@@ -319,10 +355,34 @@ class OrderHealthChecker:
                 self._normalize_price_key(order.price),
                 order.side.value.lower(),
             )
-            if key in seen:
-                duplicates.append(order)
-            else:
-                seen[key] = order
+            grouped.setdefault(key, []).append(order)
+
+        for key, orders in grouped.items():
+            local_order_ids = local_order_ids_by_key.get(key, [])
+            allowed_count = max(len(local_order_ids), 1)
+            if len(orders) <= allowed_count:
+                continue
+
+            keep_ids: set[str] = set()
+            tracked_id_set = set(local_order_ids)
+            for order in orders:
+                order_id = getattr(order, "id", None)
+                if (
+                    order_id
+                    and order_id in tracked_id_set
+                    and len(keep_ids) < allowed_count
+                ):
+                    keep_ids.add(order_id)
+
+            for order in orders:
+                order_id = getattr(order, "id", None)
+                if order_id and len(keep_ids) < allowed_count:
+                    keep_ids.add(order_id)
+
+            for order in orders:
+                order_id = getattr(order, "id", None)
+                if order_id and order_id not in keep_ids:
+                    duplicates.append(order)
 
         return duplicates
 
@@ -387,6 +447,8 @@ class OrderHealthChecker:
                 continue
             missing.append(expected)
             missing_keys.add(key)
+
+        self._update_missing_grid_tracking(missing)
 
         if not expected_orders and not supplemental_orders:
             self.logger.info(
@@ -492,6 +554,44 @@ class OrderHealthChecker:
         keys = self._get_state_open_order_price_keys()
         keys.update(self._get_engine_open_order_price_keys())
         return keys
+
+    def _iter_local_pending_orders(self) -> Iterable[GridOrder]:
+        """Yield unique pending orders from state and engine."""
+        seen_ids: set[str] = set()
+        coordinator = getattr(self.engine, "coordinator", None)
+        state = getattr(coordinator, "state", None) if coordinator else None
+
+        state_orders = state.active_orders.values() if state and getattr(state, "active_orders", None) else []
+        for order in state_orders:
+            if getattr(order, "status", None) != GridOrderStatus.PENDING:
+                continue
+            order_id = getattr(order, "order_id", None) or f"object:{id(order)}"
+            if order_id in seen_ids:
+                continue
+            seen_ids.add(order_id)
+            yield order
+
+        for order in self.engine.get_pending_orders():
+            if getattr(order, "status", None) != GridOrderStatus.PENDING:
+                continue
+            order_id = getattr(order, "order_id", None) or f"object:{id(order)}"
+            if order_id in seen_ids:
+                continue
+            seen_ids.add(order_id)
+            yield order
+
+    def _get_local_pending_order_ids_by_price_key(self) -> Dict[Tuple[str, str], List[str]]:
+        """Return locally tracked pending order ids grouped by normalized price and side."""
+        grouped: Dict[Tuple[str, str], List[str]] = {}
+        for order in self._iter_local_pending_orders():
+            order_id = getattr(order, "order_id", None)
+            if not order_id:
+                continue
+            key = self._order_price_key(order)
+            grouped.setdefault(key, [])
+            if order_id not in grouped[key]:
+                grouped[key].append(order_id)
+        return grouped
 
     def _get_local_open_grid_ids(self) -> set[int]:
         """Return tracked local pending orders grouped by grid id for base-grid repair checks."""
@@ -1017,6 +1117,75 @@ class OrderHealthChecker:
         for key in alias_keys:
             if key in self._missing_order_seen_at:
                 del self._missing_order_seen_at[key]
+
+    def _update_missing_grid_tracking(self, missing_orders: List[GridOrder]) -> None:
+        """Track which inferred grid gaps persist across health-check cycles."""
+        current_keys = {self._order_price_key(order) for order in missing_orders}
+        now = time.time()
+        for key in current_keys:
+            self._missing_grid_seen_at.setdefault(key, now)
+
+        stale_keys = set(self._missing_grid_seen_at.keys()) - current_keys
+        for key in stale_keys:
+            del self._missing_grid_seen_at[key]
+
+    def _has_persistent_missing_orders(self, missing_orders: List[GridOrder]) -> bool:
+        """Return whether any missing grid gap has persisted for at least one cooldown window."""
+        now = time.time()
+        for order in missing_orders:
+            key = self._order_price_key(order)
+            first_seen = self._missing_grid_seen_at.get(key)
+            if first_seen is not None and (now - first_seen) >= self.RECENT_FILL_COOLDOWN_SECONDS:
+                return True
+        return False
+
+    def _should_delay_gap_repair_for_recent_fill(
+        self,
+        missing_orders: List[GridOrder],
+        cleanup_count: int,
+    ) -> bool:
+        """Return whether gap repair should still respect the recent-fill cooldown."""
+        if not missing_orders or not self._has_recent_fill():
+            return False
+        if cleanup_count:
+            return False
+        if self._has_persistent_missing_orders(missing_orders):
+            return False
+        return True
+
+    def _split_missing_orders_by_unresolved(
+        self,
+        missing_orders: List[GridOrder],
+    ) -> Tuple[List[GridOrder], List[GridOrder]]:
+        """Split missing orders into unresolved-overlapping and safe-to-repair subsets."""
+        if not self._last_unresolved_order_price_keys:
+            return [], missing_orders
+
+        blocked: List[GridOrder] = []
+        repairable: List[GridOrder] = []
+        for order in missing_orders:
+            if self._order_price_key(order) in self._last_unresolved_order_price_keys:
+                blocked.append(order)
+            else:
+                repairable.append(order)
+        return blocked, repairable
+
+    def _order_price_key(self, order: GridOrder) -> Tuple[str, str]:
+        """Return one normalized price/side key for a grid order."""
+        return (
+            self._normalize_price_key(order.price),
+            order.side.value.lower(),
+        )
+
+    def _summarize_order_price_keys(self, orders: List[GridOrder], limit: int = 5) -> str:
+        """Return a compact summary of missing order price/side keys for logs."""
+        keys = [
+            f"{order.price}:{order.side.value.lower()}"
+            for order in orders[:limit]
+        ]
+        if len(orders) > limit:
+            keys.append(f"+{len(orders) - limit} more")
+        return "[" + ", ".join(keys) + "]"
 
     def _remove_order_from_state(self, order_id: str) -> None:
         """Remove one stale order from coordinator state if available."""

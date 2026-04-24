@@ -397,11 +397,15 @@ class GridCoordinator:
             # 1. 更新状态
             state_updated = self._mark_state_order_filled_with_fallback(filled_order)
             if not state_updated:
+                context_label, context_details = self._describe_fill_tracking_gap(
+                    filled_order=filled_order,
+                    engine_matches=[],
+                )
                 self.logger.info(
-                    f"Skipping already-processed or untracked fill: "
+                    f"{context_label}; skip local reverse-order handling: "
                     f"order_id={filled_order.order_id}, grid_id={filled_order.grid_id}, "
                     f"side={filled_order.side.value}, price={filled_order.price}, "
-                    f"state_active_orders={len(self.state.active_orders)}"
+                    f"{context_details}"
                 )
                 return
 
@@ -1914,13 +1918,60 @@ class GridCoordinator:
             and order.price == filled_order.price
         ]
         if not matches:
-            self.logger.warning(
-                f"State fill reconciliation found no pending match: "
+            engine_matches = [
+                order
+                for order in self.engine.get_pending_orders()
+                if getattr(order, "status", None) == GridOrderStatus.PENDING
+                and (
+                    getattr(order, "order_id", None) == filled_order.order_id
+                    or (
+                        order.grid_id == filled_order.grid_id
+                        and order.side == filled_order.side
+                        and order.price == filled_order.price
+                    )
+                )
+            ]
+            context_label, context_details = self._describe_fill_tracking_gap(
+                filled_order=filled_order,
+                engine_matches=engine_matches,
+            )
+            log_level = "warning" if engine_matches else "info"
+            getattr(self.logger, log_level)(
+                f"{context_label}: "
                 f"order_id={filled_order.order_id}, grid_id={filled_order.grid_id}, "
                 f"side={filled_order.side.value}, price={filled_order.price}, "
-                f"state_active_orders={len(self.state.active_orders)}"
+                f"{context_details}"
             )
-            return False
+            if not engine_matches:
+                return False
+
+            fallback_order = sorted(
+                engine_matches,
+                key=lambda order: (
+                    getattr(order, "created_at", None) or datetime.min,
+                    order.order_id,
+                ),
+            )[0]
+            if fallback_order.order_id not in self.state.active_orders:
+                self.state.add_order(fallback_order)
+            self.logger.warning(
+                f"Recovered state fill tracking from engine cache: "
+                f"filled_order_id={filled_order.order_id}, fallback_order_id={fallback_order.order_id}, "
+                f"grid_id={filled_order.grid_id}, side={filled_order.side.value}, "
+                f"price={filled_order.price}"
+            )
+            matched = self.state.mark_order_filled(
+                fallback_order.order_id,
+                filled_order.filled_price,
+                filled_amount,
+            )
+            self.logger.info(
+                f"State engine-cache fill result: matched={matched}, "
+                f"filled_order_id={filled_order.order_id}, fallback_order_id={fallback_order.order_id}, "
+                f"grid_id={filled_order.grid_id}, side={filled_order.side.value}, "
+                f"price={filled_order.price}"
+            )
+            return matched
 
         fallback_order = sorted(
             matches,
@@ -1947,6 +1998,43 @@ class GridCoordinator:
             f"price={filled_order.price}"
         )
         return matched
+
+    def _describe_fill_tracking_gap(
+        self,
+        filled_order: GridOrder,
+        engine_matches: List[GridOrder],
+    ) -> Tuple[str, str]:
+        """Summarize why a fill could not be matched directly in coordinator state."""
+        state_active_count = len(self.state.active_orders)
+        suspend_reason = ""
+        if hasattr(self.engine, "get_health_repair_suspend_reason"):
+            suspend_reason = self.engine.get_health_repair_suspend_reason() or ""
+
+        if engine_matches:
+            return (
+                "Recovered state fill tracking from engine cache",
+                f"fallback_matches={len(engine_matches)}, "
+                f"state_active_orders={state_active_count}, "
+                f"health_repairs_suspended={bool(suspend_reason)}, "
+                f"suspend_reason={suspend_reason or 'none'}",
+            )
+
+        if state_active_count == 0 and suspend_reason == "startup initial grid placement":
+            return (
+                "Fill arrived before startup state tracking was populated",
+                "classification=startup_race_or_external_intervention, "
+                f"state_active_orders={state_active_count}, "
+                f"engine_pending_orders={len(self.engine.get_pending_orders())}, "
+                f"suspend_reason={suspend_reason}",
+            )
+
+        return (
+            "Ignoring fill after external/manual intervention or prior reconciliation",
+            "classification=external_or_manual_intervention, "
+            f"state_active_orders={state_active_count}, "
+            f"engine_pending_orders={len(self.engine.get_pending_orders())}, "
+            f"suspend_reason={suspend_reason or 'none'}",
+        )
 
     def _sync_orders_from_engine(self):
         """
