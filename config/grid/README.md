@@ -1,192 +1,144 @@
-# 網格交易設定檔指南
+# Grid 設定檔說明
+
+這份文件整理 `config/grid/` 內各 YAML 設定檔的用途，以及 `run_grid_trading.py` 目前實際支援的設定欄位。
+
+如果範例 YAML 裡的舊註解和程式行為不一致，以這份 README 與程式實作為準。
 
 ## 設定檔清單
 
-| 檔案 | 交易所 | 類型 | 說明 |
+| 檔案 | 交易所 | 類型 | 用途 |
 |------|--------|------|------|
-| `backpack_capital_protection_long.yaml` | Backpack | follow_long | 做多完整四重保護範例 |
-| `backpack_capital_protection_short.yaml` | Backpack | follow_short | 做空完整四重保護範例 |
-| `tradexyz_test_follow_long.yaml` | TradeXYZ | follow_long | NVDA 價格移動網格測試 |
-| `tradexyz_test_long.yaml` | TradeXYZ | long | NVDA 固定範圍網格測試 |
-
----
+| `backpack_capital_protection_long.yaml` | Backpack | `follow_long` | 做多跟隨網格，四道保護全開的完整範例 |
+| `backpack_capital_protection_short.yaml` | Backpack | `follow_short` | 做空跟隨網格，四道保護全開的完整範例 |
+| `tradexyz_long.yaml` | TradeXYZ | `long` | 固定區間做多範例 |
+| `tradexyz_long_GOLD.yaml` | TradeXYZ | `long` | 黃金商品固定區間做多範例 |
+| `tradexyz_long_NVDA.yaml` | TradeXYZ | `long` | NVDA 固定區間做多範例 |
+| `tradexyz_test_follow_long.yaml` | TradeXYZ | `follow_long` | 跟隨型做多測試範例 |
+| `tradexyz_test_long.yaml` | TradeXYZ | `long` | 固定區間做多測試範例 |
 
 ## 快速啟動
 
 ```bash
-# 啟動網格交易
 uv run python run_grid_trading.py config/grid/<設定檔>.yaml
-
-# DEBUG 模式（詳細 log）
 uv run python run_grid_trading.py config/grid/<設定檔>.yaml --debug
+```
 
-# 測試後清理掛單與持倉
+測試後若要清空 TradeXYZ 掛單與持倉：
+
+```bash
 uv run python test_tradexyz_cancel_orders.py
 ```
 
----
+## YAML 基本結構
 
-## 網格類型
-
-### 固定範圍網格（`long` / `short`）
-
-在指定的 `lower_price` ~ `upper_price` 區間內佈網格。
-
-- 啟動時只掛**單方向**訂單（做多只掛低於市價的買單，做空只掛高於市價的賣單）
-- 高於/低於市價的格子**不會掛單**，避免變成 taker
-- 訂單成交後由反手機制自動掛出反方向訂單
-
-```yaml
-grid_type: "long"           # 或 "short"
-lower_price: 155.0          # 網格下限
-upper_price: 195.0          # 網格上限
-grid_interval: 5            # 每格間隔（$）
-order_amount: 0.2           # 每格數量
-```
-
-### 價格移動網格（`follow_long` / `follow_short`）
-
-不指定固定範圍，以當前市價為基準動態計算網格區間，價格移動時自動跟隨重置。
-
-```yaml
-grid_type: "follow_long"    # 或 "follow_short"
-follow_grid_count: 20       # 網格數量
-follow_timeout: 60          # 脫離超時（秒，超過後重置）
-follow_distance: 2          # 脫離距離（格數，超出後開始計時）
-price_offset_grids: 3       # 價格偏移（讓市價在網格內部，非邊界）
-grid_interval: 5.0
-order_amount: 0.1
-```
-
-### 馬丁格爾網格（`martingale_long` / `martingale_short`）
-
-與固定範圍網格相同，但每格遞增下單數量。
-
-```yaml
-grid_type: "martingale_long"
-lower_price: 155.0
-upper_price: 195.0
-grid_interval: 5
-order_amount: 0.2           # 第 1 格數量
-martingale_increment: 0.1   # 每格遞增量（第 2 格 0.3, 第 3 格 0.4...）
-```
-
----
-
-## 完整參數說明
-
-### 基礎設定
-
-| 參數 | 必填 | 說明 |
-|------|------|------|
-| `exchange` | Y | 交易所名稱（`tradexyz`, `backpack`, `binance` 等） |
-| `symbol` | Y | 交易對（`NVDA`, `BTC`, `HYPE_USDC_PERP` 等） |
-| `grid_type` | Y | 網格類型（見上方說明） |
-| `grid_interval` | Y | 每格價格間隔（$） |
-| `order_amount` | Y | 每格基礎下單數量 |
-| `quantity_precision` | Y | 數量小數位數（NVDA=1, BTC=8, ETH=6） |
-
-### 固���範圍網格專用
-
-| 參數 | 說明 |
-|------|------|
-| `lower_price` | 網格下限價格 |
-| `upper_price` | 網格上限價格 |
-
-> 網格數量 = `(upper_price - lower_price) / grid_interval`，自動計算。
->
-> 做多網格啟動時，只在**低於市價**的格子掛買單。高於市價的格子留空，等買單成交後由反手機制觸發賣單。做空反之。
-
-### 價格移動網格專用
-
-| 參數 | 預設 | 說明 |
-|------|------|------|
-| `follow_grid_count` | - | 網格總數 |
-| `follow_timeout` | 300 | 脫離超時（秒）：價格離開網格多久後重置 |
-| `follow_distance` | 1 | 脫離距離（格數）：離開幾格開始計時 |
-| `price_offset_grids` | 0 | 偏移格數：讓市價在網格內部而���邊界 |
-
-### 通用可選參數
-
-| 參數 | 預設 | 說明 |
-|------|------|------|
-| `martingale_increment` | 0.0 | 馬丁遞增量（僅馬丁模式） |
-| `reverse_order_grid_distance` | 1 | 反手掛單距離（格數）：成交後反方向掛幾格外 |
-| `order_health_check_interval` | 300 | 訂單健康檢查間隔（秒） |
-| `fee_rate` | 0.0001 | 手續費率（用於計算） |
-
----
-
-## 四重保護系統
-
-四道防線可個別啟用/關閉，觸發優先級為先到先執行。
-
-### 1. 剝頭皮模式（第一道防線）
-
-| 參數 | 預設 | 說明 |
-|------|------|------|
-| `scalping_enabled` | false | 啟用開關 |
-| `scalping_trigger_percent` | 90 | 觸發閾值（%）：買/賣單成交比例 |
-| `scalping_take_profit_grids` | 2 | 止盈距離（格數） |
-
-觸發後：取消反方向訂單 → 掛止盈單 → 成交後重置網格。
-
-### 2. 本金保護模式（第二道防線）
-
-| 參數 | 預設 | 說明 |
-|------|------|------|
-| `capital_protection_enabled` | false | 啟用開關 |
-| `capital_protection_trigger_percent` | 40 | 觸發閾值（%）：成交比例更深時觸發 |
-
-觸發後：停止掛單 → 等待抵押品回到初始本金 → 平倉重置。
-
-### 3. 止盈模式（盈利保護）
-
-| 參數 | 預設 | 說明 |
-|------|------|------|
-| `take_profit_enabled` | false | 啟用開關 |
-| `take_profit_percentage` | 0.005 | 止盈閾值（盈利 / 本金比例，0.005 = 0.5%） |
-
-觸發後：平倉所有持倉 → 鎖定利潤 → 重置網格。
-
-### 4. 價格鎖定模式（智能凍結）
-
-| 參數 | 預設 | 說明 |
-|------|------|------|
-| `price_lock_enabled` | false | 啟用開關 |
-| `price_lock_threshold` | - | 鎖定價格閾值（$）：做多時價格向上脫離至此凍結 |
-| `price_lock_start_at_threshold` | false | 啟動時若價格已超過閾值，以閾值為起點（僅 follow 模式） |
-
-觸發後：凍結網格（不平倉）→ 保留訂單和持倉 → 價格回歸後自動解除。
-
----
-
-## 設定範例
-
-### 極簡測試（固定範圍做多，保護全關）
+所有設定都放在 `grid_system` 節點下：
 
 ```yaml
 grid_system:
   exchange: "tradexyz"
   symbol: "NVDA"
   grid_type: "long"
-  lower_price: 155.0
-  upper_price: 195.0
-  grid_interval: 5
-  order_amount: 0.2
+  lower_price: 187.5
+  upper_price: 189.5
+  grid_interval: 0.1
+  order_amount: 0.1
   quantity_precision: 1
-  martingale_increment: 0.0
-  scalping_enabled: false
-  capital_protection_enabled: false
-  take_profit_enabled: false
-  price_lock_enabled: false
-  price_lock_threshold: 999999.0
-  price_lock_start_at_threshold: false
-  reverse_order_grid_distance: 1
-  order_health_check_interval: 60
 ```
 
-### 完整保護（價格移動做��，四重保護全開）
+## 先看這幾個觀念
+
+### 1. `grid_type` 決定整體模式
+
+可用值：
+
+- `long`
+- `short`
+- `follow_long`
+- `follow_short`
+- `martingale_long`
+- `martingale_short`
+
+### 2. fixed range 和 follow mode 的差別
+
+- `long` / `short` / `martingale_*`
+  需要手動提供 `lower_price` 與 `upper_price`
+- `follow_long` / `follow_short`
+  不需要固定價格區間，系統啟動時會用當前市價動態推算網格範圍
+
+### 3. 實際 runtime 預設值以 `run_grid_trading.py` 為準
+
+例如：
+
+- `enable_notifications` 預設實際是 `false`
+- `order_health_check_interval` 預設實際是 `600`
+- `fee_rate` 預設實際是 `0.0001`
+
+另外要注意：
+
+- `GridConfig` 類別裡雖然有 `price_decimals` 欄位，但目前 `run_grid_trading.py` 不會從 YAML 讀取它
+- 寫設定檔時，請優先參考這份 README 與 `run_grid_trading.py` 的載入邏輯，而不是只看 dataclass 欄位名稱
+
+## 模式說明
+
+### 固定區間網格：`long` / `short`
+
+適合你已經知道希望操作的價格區間。
+
+做多 `long`：
+
+- `Grid 1` 是最低價 `lower_price`
+- `Grid N` 是最高價 `upper_price`
+- 啟動時只會掛低於市價的買單
+- 買單成交後，再由反手機制掛出對應賣單
+
+做空 `short`：
+
+- `Grid 1` 是最高價 `upper_price`
+- `Grid N` 是最低價 `lower_price`
+- 啟動時只會掛高於市價的賣單
+- 賣單成交後，再由反手機制掛出對應買單
+
+網格數量是自動算出來的：
+
+```text
+grid_count = int((upper_price - lower_price) / grid_interval)
+```
+
+範例：
+
+```yaml
+grid_system:
+  exchange: "tradexyz"
+  symbol: "NVDA"
+  grid_type: "long"
+  lower_price: 187.5
+  upper_price: 189.5
+  grid_interval: 0.1
+  order_amount: 0.1
+  quantity_precision: 1
+```
+
+### 跟隨網格：`follow_long` / `follow_short`
+
+適合價格會持續漂移、你不想手動重設區間的情境。
+
+做多 `follow_long`：
+
+- 會以啟動時的當前價格為基準，計算上界與下界
+- 只在價格向上突破網格並超過 `follow_distance` 後，才視為獲利方向脫離並重建網格
+
+做空 `follow_short`：
+
+- 會以啟動時的當前價格為基準，計算下界與上界
+- 只在價格向下突破網格並超過 `follow_distance` 後，才視為獲利方向脫離並重建網格
+
+跟隨網格的價格區間推算重點：
+
+- `follow_grid_count` 決定總格數
+- `grid_interval` 決定每格距離
+- `price_offset_grids` 可把市價往網格內部推幾格，避免市價剛好卡在邊界
+
+範例：
 
 ```yaml
 grid_system:
@@ -200,28 +152,285 @@ grid_system:
   grid_interval: 0.5
   order_amount: 0.1
   quantity_precision: 1
+```
+
+### 馬丁網格：`martingale_long` / `martingale_short`
+
+本質上仍是 fixed range，只是不同格子的下單量會遞增。
+
+目前遞增量由 `martingale_increment` 控制：
+
+- 做多時，越靠近低價區，下單量越大
+- 做空時，越靠近高價區，下單量越大
+
+範例：
+
+```yaml
+grid_system:
+  exchange: "tradexyz"
+  symbol: "NVDA"
+  grid_type: "martingale_long"
+  lower_price: 180.0
+  upper_price: 200.0
+  grid_interval: 1.0
+  order_amount: 0.1
+  martingale_increment: 0.02
+  quantity_precision: 1
+```
+
+## 參數總表
+
+### 基礎欄位
+
+| 參數 | 必填 | 實際預設值 | 說明 |
+|------|------|------------|------|
+| `exchange` | 是 | 無 | 交易所名稱，例如 `tradexyz`、`backpack` |
+| `symbol` | 是 | 無 | 商品或交易對，例如 `NVDA`、`HYPE_USDC_PERP` |
+| `grid_type` | 是 | 無 | 網格模式 |
+| `grid_interval` | 是 | 無 | 每格價格距離 |
+| `order_amount` | 是 | 無 | 每格的基礎下單數量 |
+| `quantity_precision` | 否 | `3` | 數量小數位數 |
+| `max_position` | 否 | `null` | 最大持倉限制 |
+| `enable_notifications` | 否 | `false` | 是否啟用通知 |
+| `order_health_check_interval` | 否 | `600` | 健康檢查間隔，單位秒 |
+| `fee_rate` | 否 | `0.0001` | 手續費率，供損益估算使用 |
+
+### fixed range 專用欄位
+
+| 參數 | 必填 | 說明 |
+|------|------|------|
+| `lower_price` | 是 | 網格最低價 |
+| `upper_price` | 是 | 網格最高價 |
+
+你也可以用巢狀格式：
+
+```yaml
+grid_system:
+  grid_type: "long"
+  price_range:
+    lower_price: 187.5
+    upper_price: 189.5
+```
+
+### follow mode 專用欄位
+
+| 參數 | 必填 | 實際預設值 | 說明 |
+|------|------|------------|------|
+| `follow_grid_count` | 是 | 無 | 跟隨網格總格數 |
+| `follow_timeout` | 否 | `300` | 價格脫離後，等待多久才重建網格 |
+| `follow_distance` | 否 | `1` | 價格超出網格邊界幾格後，才開始計時 |
+| `price_offset_grids` | 否 | `0` | 啟動時把市價往網格內部偏移幾格 |
+
+### 馬丁與反手相關欄位
+
+| 參數 | 必填 | 實際預設值 | 說明 |
+|------|------|------------|------|
+| `martingale_increment` | 否 | 無 | 每格遞增量；只有大於 0 才會真正啟用馬丁邏輯 |
+| `reverse_order_grid_distance` | 否 | `1` | 成交後反手單距離幾格 |
+
+## 保護機制
+
+這套 grid 有四種額外保護／控制模式，可以單獨開啟。
+
+### 1. Scalping 模式
+
+| 參數 | 實際預設值 | 說明 |
+|------|------------|------|
+| `scalping_enabled` | `false` | 是否啟用 |
+| `scalping_trigger_percent` | `80` | 轉換成觸發格位的百分比 |
+| `scalping_take_profit_grids` | `2` | 進入 scalping 後，止盈單往 break-even 外再拉幾格 |
+
+觸發格位公式：
+
+```text
+trigger_grid = grid_count - int(grid_count * scalping_trigger_percent / 100)
+```
+
+實際行為：
+
+- 當前價格落到 `current_grid_index <= trigger_grid` 時啟動
+- 啟動後不再維持一般反手補單節奏
+- 系統會集中用一張止盈單管理目前持倉
+- 止盈單成交後：
+  - `follow_*` 模式會重建網格
+  - fixed range 模式會停止策略
+
+例子：
+
+- `grid_count = 200`
+- `scalping_trigger_percent = 90`
+- 觸發格位就是 `20`
+
+也就是價格進入較深的風險區後，才切到 scalping 模式。
+
+### 2. Capital Protection 模式
+
+| 參數 | 實際預設值 | 說明 |
+|------|------------|------|
+| `capital_protection_enabled` | `false` | 是否啟用 |
+| `capital_protection_trigger_percent` | `50` | 轉換成觸發格位的百分比 |
+
+觸發格位公式和 scalping 相同：
+
+```text
+trigger_grid = grid_count - int(grid_count * capital_protection_trigger_percent / 100)
+```
+
+實際行為：
+
+- 進入保護後，策略不再主動擴張風險
+- 會等待權益回升到保護條件，再做 reset
+
+例子：
+
+- `grid_count = 200`
+- `capital_protection_trigger_percent = 40`
+- 觸發格位就是 `120`
+
+### 3. Take Profit 模式
+
+| 參數 | 實際預設值 | 說明 |
+|------|------------|------|
+| `take_profit_enabled` | `false` | 是否啟用 |
+| `take_profit_percentage` | `0.01` | 以初始資金為基準的止盈比例 |
+
+例子：
+
+- `take_profit_percentage = 0.005`
+- 代表策略淨利達到初始資金的 `0.5%` 時觸發
+
+### 4. Price Lock 模式
+
+| 參數 | 實際預設值 | 說明 |
+|------|------------|------|
+| `price_lock_enabled` | `false` | 是否啟用 |
+| `price_lock_threshold` | 無 | 觸發鎖定的價格 |
+| `price_lock_start_at_threshold` | `false` | 僅 follow mode 使用；若啟動時價格已越過閾值，是否直接以閾值當起點 |
+
+實際行為：
+
+- 做多：當價格 `>= threshold` 時觸發鎖定
+- 做空：當價格 `<= threshold` 時觸發鎖定
+- `price_lock_start_at_threshold` 只在 `follow_long` / `follow_short` 生效
+
+## 巢狀設定
+
+### `spot_reserve`
+
+這組設定只對現貨模式有意義，用來保留一部分底層資產，不讓策略全部用掉。
+
+目前程式至少會用到這些欄位：
+
+| 欄位 | 必填 | 說明 |
+|------|------|------|
+| `enabled` | 是 | 是否啟用 |
+| `reserve_amount` | 是 | 要保留的資產數量 |
+| `spot_buy_fee_rate` | 是 | 現貨買入手續費率 |
+
+範例：
+
+```yaml
+grid_system:
+  spot_reserve:
+    enabled: true
+    reserve_amount: 0.01
+    spot_buy_fee_rate: 0.001
+```
+
+### `position_tolerance`
+
+這組設定用於健康檢查時的持倉誤差容忍。
+
+目前程式至少會用到：
+
+| 欄位 | 必填 | 實際預設值 | 說明 |
+|------|------|------------|------|
+| `tolerance_multiplier` | 否 | `0.25` | 用 `order_amount * tolerance_multiplier` 當作持倉比對容差 |
+
+範例：
+
+```yaml
+grid_system:
+  position_tolerance:
+    tolerance_multiplier: 0.5
+```
+
+## 常見範例
+
+### 範例 1：最小 fixed range long
+
+```yaml
+grid_system:
+  exchange: "tradexyz"
+  symbol: "NVDA"
+  grid_type: "long"
+  lower_price: 187.5
+  upper_price: 189.5
+  grid_interval: 0.1
+  order_amount: 0.1
+  quantity_precision: 1
+  scalping_enabled: false
+  capital_protection_enabled: false
+  take_profit_enabled: false
+  price_lock_enabled: false
+```
+
+### 範例 2：跟隨網格加四道保護
+
+```yaml
+grid_system:
+  exchange: "backpack"
+  symbol: "HYPE_USDC_PERP"
+  grid_type: "follow_long"
+  follow_grid_count: 200
+  follow_timeout: 300
+  follow_distance: 2
+  price_offset_grids: 5
+  grid_interval: 0.04
+  order_amount: 0.5
+  quantity_precision: 2
   scalping_enabled: true
-  scalping_trigger_percent: 90
+  scalping_trigger_percent: 15
   scalping_take_profit_grids: 2
   capital_protection_enabled: true
   capital_protection_trigger_percent: 40
   take_profit_enabled: true
-  take_profit_percentage: 0.005
+  take_profit_percentage: 0.002
   price_lock_enabled: true
-  price_lock_threshold: 250.0
+  price_lock_threshold: 50.0
   price_lock_start_at_threshold: false
   reverse_order_grid_distance: 1
   order_health_check_interval: 300
 ```
 
----
+### 範例 3：使用巢狀 `price_range`
 
-## 注意事項
+```yaml
+grid_system:
+  exchange: "tradexyz"
+  symbol: "NVDA"
+  grid_type: "long"
+  price_range:
+    lower_price: 187.5
+    upper_price: 189.5
+  grid_interval: 0.1
+  order_amount: 0.1
+  quantity_precision: 1
+```
 
-- 修改設定檔後必須重啟程式才能生效
-- 價格移動網格**不需要** `lower_price` / `upper_price`（會自動計算）
-- 固定範圍網格**不需要** `follow_*` 參數
-- TradeXYZ / Lighter 因 nonce 機制，下單為串行模式（較慢但穩定）
-- `price_lock_threshold` 應設在網格範圍之外（做多設在上方，做空設在下方）
-- 馬丁模式會快速累積持倉，請謹慎設定 `martingale_increment`
-- 測試完畢請執行 `uv run python test_tradexyz_cancel_orders.py` 清理掛單
+## 參數搭配建議
+
+- `follow_*` 模式請一定設定 `follow_grid_count`
+- fixed range 模式不要再放 `follow_*` 參數，避免自己混淆
+- `price_lock_threshold` 通常應放在網格區間外部
+- `martingale_increment` 會快速放大持倉，請先用很小數值測試
+- `reverse_order_grid_distance` 調大會增加單筆目標利潤，也會降低成交速度
+- scalping 與 capital protection 的百分比，本質上都是轉成格位，不是直接拿價格百分比比較
+
+## 風險與注意事項
+
+- 修改 YAML 後需要重啟程式才會生效
+- 請確認 `quantity_precision` 與交易所實際最小下單單位一致
+- 固定區間模式若 `upper_price - lower_price` 不能被 `grid_interval` 合理切分，實際 `grid_count` 會取整數
+- 部分舊範例檔仍可能留有歷史註解；若註解和公式不同，以程式公式為準
+- 實盤前請先確認交易所、商品、保護模式、清單配置都正確
