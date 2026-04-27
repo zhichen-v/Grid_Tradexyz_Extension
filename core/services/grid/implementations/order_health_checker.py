@@ -6,6 +6,7 @@ import logging
 import asyncio
 import time
 import traceback
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -237,38 +238,44 @@ class OrderHealthChecker:
             status = exchange_order.status.value.lower() if exchange_order.status else "unknown"
             filled_price = exchange_order.average or exchange_order.price or grid_order.price
             filled_amount = self._decimal_or_zero(getattr(exchange_order, "filled", Decimal("0")))
-            order_amount = self._decimal_or_zero(getattr(grid_order, "amount", Decimal("0")))
+            order_amount = self._get_logical_order_amount(grid_order)
             tolerance = self._get_order_fill_tolerance()
 
-            if self._is_user_fill_snapshot(exchange_order) and filled_amount > 0:
-                effective_fill = min(filled_amount, order_amount) if order_amount > 0 else filled_amount
-                if order_amount > 0 and effective_fill < (order_amount - tolerance):
-                    self._clear_missing_order_tracking(alias_keys)
-                    fills = []
-                    raw_data = getattr(exchange_order, "raw_data", {}) or {}
-                    if isinstance(raw_data, dict):
-                        raw_fills = raw_data.get("fills")
-                        if isinstance(raw_fills, list):
-                            fills = [fill for fill in raw_fills if isinstance(fill, dict)]
+            if self._is_user_fill_snapshot(exchange_order):
+                fills = []
+                raw_data = getattr(exchange_order, "raw_data", {}) or {}
+                if isinstance(raw_data, dict):
+                    raw_fills = raw_data.get("fills")
+                    if isinstance(raw_fills, list):
+                        fills = [fill for fill in raw_fills if isinstance(fill, dict)]
 
+                if filled_amount > 0 or fills:
                     self._record_partial_fill_snapshot(
                         grid_order,
                         filled_price,
-                        effective_fill,
+                        filled_amount,
                         fills=fills,
                     )
-                    continue
+                    effective_fill = self._get_cumulative_fill_amount(grid_order)
+                    if order_amount > 0:
+                        effective_fill = min(effective_fill, order_amount)
+                    if order_amount > 0 and effective_fill < (order_amount - tolerance):
+                        self._clear_missing_order_tracking(alias_keys)
+                        continue
 
-                if order_amount > 0 and abs(order_amount - effective_fill) <= tolerance:
-                    self._clear_missing_order_tracking(alias_keys)
-                    grid_order.mark_filled(filled_price, order_amount)
-                    filled_orders.append(grid_order)
-                    self._clear_pending_order_refs(grid_order, alias_keys)
-                    continue
+                    if order_amount > 0 and abs(order_amount - effective_fill) <= tolerance:
+                        self._clear_missing_order_tracking(alias_keys)
+                        grid_order.mark_filled(filled_price, order_amount)
+                        filled_orders.append(grid_order)
+                        self._clear_pending_order_refs(grid_order, alias_keys)
+                        continue
 
             if status == "filled" and not self._is_inferred_order(exchange_order):
                 self._clear_missing_order_tracking(alias_keys)
-                finalized_amount = filled_amount or grid_order.amount
+                finalized_amount = self._get_finalized_fill_amount(
+                    grid_order,
+                    filled_amount or grid_order.amount,
+                )
                 grid_order.mark_filled(filled_price, finalized_amount)
                 filled_orders.append(grid_order)
                 self._clear_pending_order_refs(grid_order, alias_keys)
@@ -437,16 +444,23 @@ class OrderHealthChecker:
                 continue
             if key in missing_keys:
                 continue
+            repair_amount = self._get_remaining_repair_amount(expected)
+            if repair_amount <= self._get_order_fill_tolerance():
+                continue
             missing.append(
                 GridOrder(
                     order_id=expected.order_id,
                     grid_id=expected.grid_id,
                     side=expected.side,
                     price=expected.price,
-                    amount=expected.amount,
+                    amount=repair_amount,
                     status=GridOrderStatus.PENDING,
                     created_at=datetime.now(),
                     parent_order_id=expected.parent_order_id,
+                    exchange_data=self._build_continuation_exchange_data(
+                        expected,
+                        repair_amount,
+                    ),
                 )
             )
             missing_keys.add(key)
@@ -939,43 +953,10 @@ class OrderHealthChecker:
         grid_order: GridOrder,
         filled_price: Decimal,
         filled_amount: Decimal,
-
         fills: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Store a conservative partial-fill snapshot so health checks do not over-repair it."""
-        if not isinstance(getattr(grid_order, "exchange_data", None), dict):
-            grid_order.exchange_data = {}
-
-        tracking = grid_order.exchange_data.get("tradexyz_fill_tracking")
-        if not isinstance(tracking, dict):
-            tracking = {}
-            grid_order.exchange_data["tradexyz_fill_tracking"] = tracking
-
-        previous_amount = self._decimal_or_zero(tracking.get("cumulative_filled"))
-        if filled_amount <= previous_amount:
-            return
-
-        order_amount = self._decimal_or_zero(getattr(grid_order, "amount", Decimal("0")))
-        normalized_fill = min(filled_amount, order_amount) if order_amount > 0 else filled_amount
-        tracking["cumulative_filled"] = str(normalized_fill)
-        tracking["remaining_amount"] = str(max(order_amount - normalized_fill, Decimal("0")))
-        tracking["last_fill_price"] = str(filled_price)
-
-        self.logger.info(
-            "Recorded partial fill snapshot from health-check: "
-            f"grid_id={grid_order.grid_id}, side={grid_order.side.value}, "
-            f"cumulative={normalized_fill}, order_amount={order_amount}, order_id={grid_order.order_id}"
-        )
-
-    def _record_partial_fill_snapshot(
-        self,
-        grid_order: GridOrder,
-        filled_price: Decimal,
-        filled_amount: Decimal,
-        fills: Optional[List[Dict[str, Any]]] = None,
-    ) -> None:
-        """Store a conservative partial-fill snapshot so health checks do not over-repair it."""
-        order_amount = self._decimal_or_zero(getattr(grid_order, "amount", Decimal("0")))
+        order_amount = self._get_logical_order_amount(grid_order)
         tracking = self._get_tradexyz_fill_tracking(grid_order)
         previous_amount = self._decimal_or_zero(tracking.get("cumulative_filled"))
         recorded_from_snapshot = False
@@ -1006,11 +987,17 @@ class OrderHealthChecker:
                 snapshot_fill_count += 1
 
         normalized_fill = self._decimal_or_zero(tracking.get("cumulative_filled"))
-        snapshot_fill = min(filled_amount, order_amount) if order_amount > 0 else filled_amount
-        if snapshot_fill > normalized_fill:
-            tracking["cumulative_filled"] = str(snapshot_fill)
+        carry_amount = self._decimal_or_zero(tracking.get("carry_filled_amount"))
+        if order_amount > 0:
+            snapshot_fill = min(filled_amount, max(order_amount - carry_amount, Decimal("0")))
+        else:
+            snapshot_fill = filled_amount
+        snapshot_cumulative = carry_amount + snapshot_fill
+        if snapshot_cumulative > normalized_fill:
+            tracking["snapshot_cumulative_filled"] = str(snapshot_fill)
+            tracking["cumulative_filled"] = str(snapshot_cumulative)
             tracking["last_fill_price"] = str(filled_price)
-            normalized_fill = snapshot_fill
+            normalized_fill = snapshot_cumulative
             recorded_from_snapshot = True
 
         if normalized_fill <= previous_amount:
@@ -1020,7 +1007,7 @@ class OrderHealthChecker:
         self.logger.info(
             "Recorded partial fill snapshot from health-check: "
             f"grid_id={grid_order.grid_id}, side={grid_order.side.value}, "
-            f"cumulative={normalized_fill}, order_amount={order_amount}, "
+            f"cumulative={normalized_fill}, target_amount={order_amount}, "
             f"snapshot_fills={snapshot_fill_count}, ledger_updated={recorded_from_snapshot}, "
             f"order_id={grid_order.order_id}"
         )
@@ -1066,12 +1053,83 @@ class OrderHealthChecker:
                 if stale_key not in seen_fill_ids:
                     fills_by_id.pop(stale_key, None)
 
-        cumulative_filled = Decimal("0")
+        snapshot_floor = self._decimal_or_zero(tracking.get("snapshot_cumulative_filled"))
+        carry_amount = self._decimal_or_zero(tracking.get("carry_filled_amount"))
+        ledger_total = Decimal("0")
         for fill_info in fills_by_id.values():
-            cumulative_filled += self._decimal_or_zero(fill_info.get("amount"))
+            ledger_total += self._decimal_or_zero(fill_info.get("amount"))
+        current_order_filled = (
+            ledger_total
+            if ledger_total >= snapshot_floor
+            else snapshot_floor + ledger_total
+        )
+        cumulative_filled = carry_amount + current_order_filled
         tracking["cumulative_filled"] = str(cumulative_filled)
         tracking["last_fill_price"] = str(filled_price)
         return True
+
+    def _get_logical_order_amount(self, grid_order: GridOrder) -> Decimal:
+        """Return the logical full amount for a possibly restored partial order."""
+        tracking = self._get_tradexyz_fill_tracking(grid_order)
+        target_amount = self._decimal_or_zero(tracking.get("target_amount"))
+        order_amount = self._decimal_or_zero(getattr(grid_order, "amount", Decimal("0")))
+        if target_amount <= 0:
+            target_amount = order_amount
+            if target_amount > 0:
+                tracking["target_amount"] = str(target_amount)
+        return target_amount
+
+    def _get_cumulative_fill_amount(self, grid_order: GridOrder) -> Decimal:
+        """Return the cumulative fill amount recorded for the logical order."""
+        tracking = self._get_tradexyz_fill_tracking(grid_order)
+        return self._decimal_or_zero(tracking.get("cumulative_filled"))
+
+    def _get_remaining_repair_amount(self, grid_order: GridOrder) -> Decimal:
+        """Return the amount that should be submitted to complete a missing order."""
+        target_amount = self._get_logical_order_amount(grid_order)
+        cumulative_filled = self._get_cumulative_fill_amount(grid_order)
+        if target_amount <= 0:
+            return self._decimal_or_zero(getattr(grid_order, "amount", Decimal("0")))
+        return max(target_amount - min(cumulative_filled, target_amount), Decimal("0"))
+
+    def _get_finalized_fill_amount(
+        self,
+        grid_order: GridOrder,
+        reported_fill_amount: Decimal,
+    ) -> Decimal:
+        """Return the logical amount to use when a restored partial order completes."""
+        target_amount = self._get_logical_order_amount(grid_order)
+        cumulative_filled = self._get_cumulative_fill_amount(grid_order)
+        if target_amount > 0 and cumulative_filled > 0:
+            return target_amount
+        return reported_fill_amount
+
+    def _build_continuation_exchange_data(
+        self,
+        grid_order: GridOrder,
+        remaining_amount: Decimal,
+    ) -> Dict[str, Any]:
+        """Carry partial-fill ledger data onto a replacement missing order."""
+        data = deepcopy(grid_order.exchange_data) if isinstance(grid_order.exchange_data, dict) else {}
+        tracking = data.get("tradexyz_fill_tracking")
+        if not isinstance(tracking, dict):
+            tracking = {}
+            data["tradexyz_fill_tracking"] = tracking
+
+        target_amount = self._get_logical_order_amount(grid_order)
+        cumulative_filled = self._get_cumulative_fill_amount(grid_order)
+        prior_fills = tracking.get("fills_by_id")
+        if prior_fills and "prior_fills_by_id" not in tracking:
+            tracking["prior_fills_by_id"] = deepcopy(prior_fills)
+        tracking["fills_by_id"] = {}
+        tracking["seen_fill_ids"] = []
+        tracking["carry_filled_amount"] = str(cumulative_filled)
+        tracking["snapshot_cumulative_filled"] = "0"
+        tracking["target_amount"] = str(target_amount)
+        tracking["cumulative_filled"] = str(cumulative_filled)
+        tracking["remaining_amount"] = str(remaining_amount)
+        tracking["continuation_source_order_id"] = str(getattr(grid_order, "order_id", "") or "")
+        return data
 
     def _build_tradexyz_fill_event_key(
         self,
@@ -1485,9 +1543,9 @@ class OrderHealthChecker:
             if cumulative_filled <= 0:
                 continue
 
-            order_amount = self._decimal_or_zero(getattr(order, "amount", Decimal("0")))
-            if order_amount > 0:
-                cumulative_filled = min(cumulative_filled, order_amount)
+            target_amount = self._get_logical_order_amount(order)
+            if target_amount > 0:
+                cumulative_filled = min(cumulative_filled, target_amount)
             total += cumulative_filled
 
         return total

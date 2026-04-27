@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import traceback
+from copy import deepcopy
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -142,7 +143,10 @@ class GridEngineImpl(IGridEngine):
 
             order.order_id = order_id
             order.status = GridOrderStatus.PENDING
-            order.exchange_data = getattr(exchange_order, "raw_data", {}) or {}
+            order.exchange_data = self._merge_order_exchange_data(
+                order,
+                getattr(exchange_order, "raw_data", {}) or {},
+            )
             self._register_pending_order(order, order_id, client_id)
 
             self.logger.info(
@@ -799,9 +803,24 @@ class GridEngineImpl(IGridEngine):
                     if getattr(exchange_order, "status", None)
                     else "unknown"
                 )
+                if self._is_user_fill_snapshot(exchange_order):
+                    handled, finalized = await self._handle_tradexyz_user_fill_snapshot(
+                        grid_order,
+                        exchange_order,
+                        "REST polling",
+                        *aliases,
+                    )
+                    if handled:
+                        if finalized:
+                            removed_count += 1
+                        continue
+
                 if status == "filled":
                     filled_price = exchange_order.average or exchange_order.price or grid_order.price
-                    filled_amount = exchange_order.filled or grid_order.amount
+                    filled_amount = self._get_finalized_fill_amount(
+                        grid_order,
+                        exchange_order.filled or grid_order.amount,
+                    )
                     grid_order.mark_filled(filled_price, filled_amount)
                     self._clear_pending_order_refs(*aliases)
                     filled_in_sync.append(grid_order)
@@ -1104,7 +1123,7 @@ class GridEngineImpl(IGridEngine):
             tracking.get("cumulative_filled"),
             Decimal("0"),
         )
-        order_amount = grid_order.amount or Decimal("0")
+        order_amount = self._ensure_tradexyz_target_amount(grid_order)
         tolerance = self._get_order_fill_tolerance()
 
         if order_amount > 0 and cumulative_filled > order_amount:
@@ -1145,6 +1164,108 @@ class GridEngineImpl(IGridEngine):
             *keys,
         )
         return True
+
+    async def _handle_tradexyz_user_fill_snapshot(
+        self,
+        grid_order: GridOrder,
+        exchange_order: ExchangeOrderData,
+        source: str,
+        *keys: Optional[str],
+    ) -> Tuple[bool, bool]:
+        """Apply a TradeXYZ REST userFills snapshot without finalizing partial fills."""
+        filled_price = exchange_order.average or exchange_order.price or grid_order.price
+        snapshot_fill = self._safe_decimal(
+            getattr(exchange_order, "filled", None),
+            Decimal("0"),
+        )
+        raw_data = getattr(exchange_order, "raw_data", {}) or {}
+        fills = []
+        if isinstance(raw_data, dict) and isinstance(raw_data.get("fills"), list):
+            fills = [fill for fill in raw_data["fills"] if isinstance(fill, dict)]
+
+        if snapshot_fill <= 0 and not fills:
+            return False, False
+
+        tracking = self._get_tradexyz_fill_tracking(grid_order)
+        target_amount = self._ensure_tradexyz_target_amount(grid_order)
+        recorded_count = 0
+
+        for fill in fills:
+            fill_price = self._safe_decimal(
+                fill.get("px") or fill.get("avgPx") or fill.get("price"),
+                filled_price,
+            )
+            fill_amount = self._safe_decimal(
+                fill.get("sz") or fill.get("filledSz") or fill.get("filled"),
+                Decimal("0"),
+            )
+            if fill_amount <= 0:
+                continue
+            event_key = self._build_tradexyz_fill_event_key(
+                fill,
+                grid_order,
+                fill_price,
+                fill_amount,
+            )
+            if self._record_tradexyz_fill_entry(
+                tracking,
+                event_key,
+                fill_amount,
+                fill_price,
+            ):
+                recorded_count += 1
+
+        cumulative_filled = self._safe_decimal(
+            tracking.get("cumulative_filled"),
+            Decimal("0"),
+        )
+        carry_amount = self._safe_decimal(
+            tracking.get("carry_filled_amount"),
+            Decimal("0"),
+        )
+        if target_amount > 0:
+            snapshot_fill = min(snapshot_fill, max(target_amount - carry_amount, Decimal("0")))
+        snapshot_cumulative = carry_amount + snapshot_fill
+        if snapshot_cumulative > cumulative_filled:
+            tracking["snapshot_cumulative_filled"] = str(snapshot_fill)
+            tracking["cumulative_filled"] = str(snapshot_cumulative)
+            tracking["last_fill_price"] = str(filled_price)
+            cumulative_filled = snapshot_cumulative
+
+        tolerance = self._get_order_fill_tolerance()
+        if target_amount > 0 and cumulative_filled > target_amount:
+            overflow = cumulative_filled - target_amount
+            if overflow > tolerance:
+                self.logger.warning(
+                    f"TradeXYZ REST fill snapshot overflow detected: "
+                    f"grid_id={grid_order.grid_id}, order_id={grid_order.order_id}, "
+                    f"cumulative={cumulative_filled}, target_amount={target_amount}"
+                )
+            cumulative_filled = target_amount
+            tracking["cumulative_filled"] = str(cumulative_filled)
+
+        remaining = max(target_amount - cumulative_filled, Decimal("0"))
+        tracking["remaining_amount"] = str(remaining)
+        self.logger.info(
+            f"{source} TradeXYZ fill snapshot applied: "
+            f"grid_id={grid_order.grid_id}, side={grid_order.side.value}, "
+            f"cumulative={cumulative_filled}, remaining={remaining}, "
+            f"target_amount={target_amount}, recorded_fills={recorded_count}, "
+            f"order_id={grid_order.order_id}"
+        )
+
+        if target_amount > 0 and remaining > tolerance:
+            return True, False
+
+        final_amount = target_amount if target_amount > 0 else cumulative_filled
+        await self._finalize_fill(
+            grid_order,
+            filled_price,
+            final_amount,
+            f"{source} TradeXYZ final fill snapshot",
+            *keys,
+        )
+        return True, True
 
     async def _handle_binance_style_update(self, data: Dict[str, Any]):
         """Handle updates that use Binance-style fields such as X, i, p, and z."""
@@ -1321,14 +1442,29 @@ class GridEngineImpl(IGridEngine):
             )
             return
 
+        remaining_amount = self._get_remaining_order_amount(grid_order)
+        if remaining_amount <= self._get_order_fill_tolerance():
+            self.logger.info(
+                "Skip order restoration because the logical order is already filled: "
+                f"grid_id={grid_order.grid_id}, side={grid_order.side.value}, "
+                f"price={grid_order.price}, source_order_id={order_id}"
+            )
+            return
+
         replacement_order = GridOrder(
             order_id="",
             grid_id=grid_order.grid_id,
             side=grid_order.side,
             price=grid_order.price,
-            amount=grid_order.amount,
+            amount=remaining_amount,
             status=GridOrderStatus.PENDING,
             created_at=datetime.now(),
+            parent_order_id=grid_order.parent_order_id,
+            exchange_data=self._build_continuation_exchange_data(
+                grid_order,
+                remaining_amount,
+                order_id,
+            ),
         )
 
         try:
@@ -1440,6 +1576,25 @@ class GridEngineImpl(IGridEngine):
         price_token = int(order.price or 0)
         return f"grid_{order.grid_id}_{price_token}_{amount_token}"
 
+    def _merge_order_exchange_data(
+        self,
+        order: GridOrder,
+        raw_exchange_data: Any,
+    ) -> Dict[str, Any]:
+        """Preserve local fill tracking while attaching the latest exchange payload."""
+        existing = order.exchange_data if isinstance(order.exchange_data, dict) else {}
+        merged = deepcopy(existing)
+
+        if isinstance(raw_exchange_data, dict):
+            for key, value in raw_exchange_data.items():
+                merged.setdefault(key, value)
+            if raw_exchange_data:
+                merged["exchange_order_raw"] = raw_exchange_data
+        elif raw_exchange_data:
+            merged["exchange_order_raw"] = raw_exchange_data
+
+        return merged
+
     def _get_tradexyz_fill_tracking(self, grid_order: GridOrder) -> Dict[str, Any]:
         """Return mutable TradeXYZ user-fill tracking data for one pending order."""
         if not isinstance(grid_order.exchange_data, dict):
@@ -1482,12 +1637,104 @@ class GridEngineImpl(IGridEngine):
                 if stale_key not in seen_fill_ids:
                     fills_by_id.pop(stale_key, None)
 
-        cumulative_filled = Decimal("0")
+        snapshot_floor = self._safe_decimal(
+            tracking.get("snapshot_cumulative_filled"),
+            Decimal("0"),
+        )
+        carry_amount = self._safe_decimal(
+            tracking.get("carry_filled_amount"),
+            Decimal("0"),
+        )
+        ledger_total = Decimal("0")
         for fill_info in fills_by_id.values():
-            cumulative_filled += self._safe_decimal(fill_info.get("amount"), Decimal("0"))
+            ledger_total += self._safe_decimal(fill_info.get("amount"), Decimal("0"))
+        current_order_filled = (
+            ledger_total
+            if ledger_total >= snapshot_floor
+            else snapshot_floor + ledger_total
+        )
+        cumulative_filled = carry_amount + current_order_filled
         tracking["cumulative_filled"] = str(cumulative_filled)
         tracking["last_fill_price"] = normalized_price
         return True
+
+    def _ensure_tradexyz_target_amount(self, grid_order: GridOrder) -> Decimal:
+        """Return the logical full amount for a possibly restored partial order."""
+        tracking = self._get_tradexyz_fill_tracking(grid_order)
+        target_amount = self._safe_decimal(
+            tracking.get("target_amount"),
+            Decimal("0"),
+        )
+        order_amount = self._safe_decimal(
+            getattr(grid_order, "amount", None),
+            Decimal("0"),
+        )
+        if target_amount <= 0:
+            target_amount = order_amount
+            if target_amount > 0:
+                tracking["target_amount"] = str(target_amount)
+        return target_amount
+
+    def _get_cumulative_fill_amount(self, grid_order: GridOrder) -> Decimal:
+        """Return the cumulative logical fill amount currently recorded locally."""
+        tracking = self._get_tradexyz_fill_tracking(grid_order)
+        return self._safe_decimal(
+            tracking.get("cumulative_filled"),
+            Decimal("0"),
+        )
+
+    def _get_remaining_order_amount(self, grid_order: GridOrder) -> Decimal:
+        """Return the exchange amount still needed to complete the logical order."""
+        target_amount = self._ensure_tradexyz_target_amount(grid_order)
+        cumulative_filled = self._get_cumulative_fill_amount(grid_order)
+        if target_amount <= 0:
+            return self._safe_decimal(getattr(grid_order, "amount", None), Decimal("0"))
+        return max(target_amount - min(cumulative_filled, target_amount), Decimal("0"))
+
+    def _get_finalized_fill_amount(
+        self,
+        grid_order: GridOrder,
+        reported_fill_amount: Decimal,
+    ) -> Decimal:
+        """Return the logical amount to use when a restored partial order completes."""
+        target_amount = self._ensure_tradexyz_target_amount(grid_order)
+        cumulative_filled = self._get_cumulative_fill_amount(grid_order)
+        if target_amount > 0 and cumulative_filled > 0:
+            return target_amount
+        return reported_fill_amount
+
+    def _build_continuation_exchange_data(
+        self,
+        grid_order: GridOrder,
+        remaining_amount: Decimal,
+        source_order_id: str,
+    ) -> Dict[str, Any]:
+        """Carry partial-fill ledger data onto a replacement exchange order."""
+        data = deepcopy(grid_order.exchange_data) if isinstance(grid_order.exchange_data, dict) else {}
+        tracking = data.get("tradexyz_fill_tracking")
+        if not isinstance(tracking, dict):
+            tracking = {}
+            data["tradexyz_fill_tracking"] = tracking
+
+        target_amount = self._ensure_tradexyz_target_amount(grid_order)
+        cumulative_filled = self._get_cumulative_fill_amount(grid_order)
+        prior_fills = tracking.get("fills_by_id")
+        if prior_fills and "prior_fills_by_id" not in tracking:
+            tracking["prior_fills_by_id"] = deepcopy(prior_fills)
+        tracking["fills_by_id"] = {}
+        tracking["seen_fill_ids"] = []
+        tracking["carry_filled_amount"] = str(cumulative_filled)
+        tracking["snapshot_cumulative_filled"] = "0"
+        tracking["target_amount"] = str(target_amount)
+        tracking["cumulative_filled"] = str(cumulative_filled)
+        tracking["remaining_amount"] = str(remaining_amount)
+        tracking["continuation_source_order_id"] = str(source_order_id or "")
+        return data
+
+    def _is_user_fill_snapshot(self, exchange_order: ExchangeOrderData) -> bool:
+        """Return whether get_order() only has a TradeXYZ user-fill snapshot."""
+        params = getattr(exchange_order, "params", {}) or {}
+        return bool(params.get("user_fill_snapshot_only"))
 
     def _build_tradexyz_fill_event_key(
         self,
