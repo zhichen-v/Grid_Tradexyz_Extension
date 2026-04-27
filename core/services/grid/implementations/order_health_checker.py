@@ -363,14 +363,24 @@ class OrderHealthChecker:
 
         for key, orders in grouped.items():
             local_order_ids = local_order_ids_by_key.get(key, [])
-            allowed_count = max(len(local_order_ids), 1)
+            exchange_order_ids = {
+                str(order_id)
+                for order in orders
+                for order_id in [getattr(order, "id", None)]
+                if order_id
+            }
+            tracked_exchange_order_ids = [
+                order_id for order_id in local_order_ids if order_id in exchange_order_ids
+            ]
+            allowed_count = max(len(tracked_exchange_order_ids), 1)
             if len(orders) <= allowed_count:
                 continue
 
             keep_ids: set[str] = set()
-            tracked_id_set = set(local_order_ids)
+            tracked_id_set = set(tracked_exchange_order_ids)
             for order in orders:
-                order_id = getattr(order, "id", None)
+                raw_order_id = getattr(order, "id", None)
+                order_id = str(raw_order_id) if raw_order_id else None
                 if (
                     order_id
                     and order_id in tracked_id_set
@@ -379,12 +389,14 @@ class OrderHealthChecker:
                     keep_ids.add(order_id)
 
             for order in orders:
-                order_id = getattr(order, "id", None)
+                raw_order_id = getattr(order, "id", None)
+                order_id = str(raw_order_id) if raw_order_id else None
                 if order_id and len(keep_ids) < allowed_count:
                     keep_ids.add(order_id)
 
             for order in orders:
-                order_id = getattr(order, "id", None)
+                raw_order_id = getattr(order, "id", None)
+                order_id = str(raw_order_id) if raw_order_id else None
                 if order_id and order_id not in keep_ids:
                     duplicates.append(order)
 
@@ -402,14 +414,16 @@ class OrderHealthChecker:
             for order in exchange_orders
             if getattr(order, "price", None) is not None
         }
-        existing_keys.update(self._get_local_open_order_price_keys())
         existing_grid_ids = {
             grid_id
             for order in exchange_orders
             for grid_id in [self._grid_id_from_price(order.price)]
             if grid_id is not None
         }
-        existing_grid_ids.update(self._get_local_open_grid_ids())
+        protected_grid_ids = self._get_local_protected_base_grid_ids()
+        protected_grid_ids.update(
+            self._get_exchange_protected_base_grid_ids(exchange_orders)
+        )
 
         missing: List[GridOrder] = []
         missing_keys: set[Tuple[str, str]] = set()
@@ -425,7 +439,7 @@ class OrderHealthChecker:
                 continue
             missing.append(
                 GridOrder(
-                    order_id="",
+                    order_id=expected.order_id,
                     grid_id=expected.grid_id,
                     side=expected.side,
                     price=expected.price,
@@ -440,6 +454,7 @@ class OrderHealthChecker:
         supplemental_orders = self._build_missing_base_grid_orders(
             current_price=current_price,
             existing_grid_ids=existing_grid_ids,
+            protected_grid_ids=protected_grid_ids,
             existing_keys=existing_keys,
         )
         for expected in supplemental_orders:
@@ -472,6 +487,7 @@ class OrderHealthChecker:
         self,
         current_price: Decimal,
         existing_grid_ids: set[int],
+        protected_grid_ids: set[int],
         existing_keys: set[Tuple[str, str]],
     ) -> List[GridOrder]:
         """Infer missing base-side maker orders from the current price and grid range."""
@@ -485,6 +501,8 @@ class OrderHealthChecker:
             if not self._should_have_base_order(grid_price=price, current_price=current_price):
                 continue
             if grid_id in existing_grid_ids:
+                continue
+            if grid_id in protected_grid_ids:
                 continue
             if self._is_grid_locked(grid_id):
                 continue
@@ -511,28 +529,39 @@ class OrderHealthChecker:
         return missing
 
     def _get_expected_open_orders(self) -> List[GridOrder]:
-        """Return the tracked open orders that should still exist on the exchange."""
+        """Return all tracked open orders that should still exist on the exchange."""
+        expected_orders: List[GridOrder] = []
+        seen_order_ids: set[str] = set()
+        seen_price_keys: set[Tuple[str, str]] = set()
+
+        def append_order(order: GridOrder) -> None:
+            if getattr(order, "status", None) != GridOrderStatus.PENDING:
+                return
+
+            order_id = getattr(order, "order_id", None)
+            if order_id:
+                normalized_id = str(order_id)
+                if normalized_id in seen_order_ids:
+                    return
+                seen_order_ids.add(normalized_id)
+
+            key = self._order_price_key(order)
+            if key in seen_price_keys:
+                return
+            seen_price_keys.add(key)
+            expected_orders.append(order)
+
         coordinator = getattr(self.engine, "coordinator", None)
         state = getattr(coordinator, "state", None) if coordinator else None
 
         if state and getattr(state, "active_orders", None):
-            state_orders = [
-                order
-                for order in state.active_orders.values()
-                if getattr(order, "status", None) == GridOrderStatus.PENDING
-            ]
-            if state_orders:
-                return state_orders
+            for order in state.active_orders.values():
+                append_order(order)
 
-        engine_orders = [
-            order
-            for order in self.engine.get_pending_orders()
-            if getattr(order, "status", None) == GridOrderStatus.PENDING
-        ]
-        if engine_orders:
-            return engine_orders
+        for order in self.engine.get_pending_orders():
+            append_order(order)
 
-        return []
+        return expected_orders
 
     def _get_local_open_order_keys(self) -> set[Tuple[int, str]]:
         """Return tracked local pending orders grouped by grid id and side."""
@@ -551,12 +580,6 @@ class OrderHealthChecker:
                 continue
             keys.add((order.grid_id, order.side.value.lower()))
 
-        return keys
-
-    def _get_local_open_order_price_keys(self) -> set[Tuple[str, str]]:
-        """Return tracked local pending orders grouped by normalized price and side."""
-        keys = self._get_state_open_order_price_keys()
-        keys.update(self._get_engine_open_order_price_keys())
         return keys
 
     def _iter_local_pending_orders(self) -> Iterable[GridOrder]:
@@ -591,30 +614,67 @@ class OrderHealthChecker:
             order_id = getattr(order, "order_id", None)
             if not order_id:
                 continue
+            normalized_order_id = str(order_id)
             key = self._order_price_key(order)
             grouped.setdefault(key, [])
-            if order_id not in grouped[key]:
-                grouped[key].append(order_id)
+            if normalized_order_id not in grouped[key]:
+                grouped[key].append(normalized_order_id)
         return grouped
 
-    def _get_local_open_grid_ids(self) -> set[int]:
-        """Return tracked local pending orders grouped by grid id for base-grid repair checks."""
-        grid_ids: set[int] = set()
+    def _get_local_protected_base_grid_ids(self) -> set[int]:
+        """Return local TP/reverse grid ids that should block base-side fallback repair."""
+        protected: set[int] = set()
+        base_side = self._base_side_for_grid_type()
+        if base_side is None:
+            return protected
 
-        coordinator = getattr(self.engine, "coordinator", None)
-        state = getattr(coordinator, "state", None) if coordinator else None
-        if state and getattr(state, "active_orders", None):
-            for order in state.active_orders.values():
-                if getattr(order, "status", None) != GridOrderStatus.PENDING:
-                    continue
-                grid_ids.add(order.grid_id)
+        for order in self._iter_local_pending_orders():
+            if getattr(order, "parent_order_id", None) or order.side != base_side:
+                protected.add(order.grid_id)
 
-        for order in self.engine.get_pending_orders():
-            if getattr(order, "status", None) != GridOrderStatus.PENDING:
+        return protected
+
+    def _get_exchange_protected_base_grid_ids(
+        self,
+        exchange_orders: List[OrderData],
+    ) -> set[int]:
+        """Infer base grid ids protected by live exchange-side reverse orders."""
+        protected: set[int] = set()
+        base_side = self._base_side_for_grid_type()
+        if base_side is None:
+            return protected
+
+        distance = getattr(self.config, "reverse_order_grid_distance", 1) or 1
+        try:
+            reverse_offset = self.config.grid_interval * Decimal(str(distance))
+        except Exception:
+            reverse_offset = self.config.grid_interval
+
+        for order in exchange_orders:
+            price = getattr(order, "price", None)
+            side = getattr(order, "side", None)
+            if price is None or side is None:
                 continue
-            grid_ids.add(order.grid_id)
 
-        return grid_ids
+            order_side = (
+                GridOrderSide.BUY
+                if side.value.lower() == "buy"
+                else GridOrderSide.SELL
+            )
+            if order_side == base_side:
+                continue
+
+            order_price = Decimal(str(price))
+            if base_side == GridOrderSide.BUY:
+                source_price = order_price - reverse_offset
+            else:
+                source_price = order_price + reverse_offset
+
+            grid_id = self._grid_id_from_price(source_price)
+            if grid_id is not None:
+                protected.add(grid_id)
+
+        return protected
 
     def _get_state_open_order_keys(self) -> set[Tuple[int, str]]:
         """Return coordinator-state pending orders grouped by grid id and side."""
@@ -1589,9 +1649,18 @@ class OrderHealthChecker:
         if not orders:
             return 0
 
+        source_order_ids = {
+            id(order): getattr(order, "order_id", None)
+            for order in orders
+        }
+
         if len(orders) == 1:
             placed = await self.engine.place_order(orders[0])
             if placed:
+                self._sync_placed_missing_order_to_state(
+                    placed,
+                    source_order_ids.get(id(orders[0])),
+                )
                 self.logger.info(
                     f"Placed missing grid order: grid_id={placed.grid_id}, "
                     f"side={placed.side.value}, price={placed.price}, amount={placed.amount}"
@@ -1601,11 +1670,58 @@ class OrderHealthChecker:
 
         placed_orders = await self.engine.place_batch_orders(orders)
         for order in placed_orders:
+            self._sync_placed_missing_order_to_state(
+                order,
+                source_order_ids.get(id(order)),
+            )
             self.logger.info(
                 f"Placed missing grid order: grid_id={order.grid_id}, "
                 f"side={order.side.value}, price={order.price}, amount={order.amount}"
             )
         return len(placed_orders)
+
+    def _sync_placed_missing_order_to_state(
+        self,
+        placed_order: GridOrder,
+        source_order_id: Optional[str],
+    ) -> None:
+        """Replace stale coordinator-state entries with a repaired exchange order."""
+        coordinator = getattr(self.engine, "coordinator", None)
+        state = getattr(coordinator, "state", None) if coordinator else None
+        if not state or not hasattr(state, "active_orders"):
+            return
+
+        active_orders = state.active_orders
+        remove_ids: List[str] = []
+        normalized_source_id = str(source_order_id) if source_order_id else ""
+        new_order_id = getattr(placed_order, "order_id", "")
+
+        for order_id, order in list(active_orders.items()):
+            if order_id == new_order_id:
+                continue
+            if normalized_source_id and order_id == normalized_source_id:
+                remove_ids.append(order_id)
+                continue
+            if (
+                getattr(order, "status", None) == GridOrderStatus.PENDING
+                and order.grid_id == placed_order.grid_id
+                and order.side == placed_order.side
+                and self._normalize_price_key(order.price)
+                == self._normalize_price_key(placed_order.price)
+            ):
+                remove_ids.append(order_id)
+
+        for order_id in remove_ids:
+            if hasattr(state, "remove_order"):
+                state.remove_order(order_id)
+            else:
+                active_orders.pop(order_id, None)
+
+        if new_order_id not in active_orders:
+            if hasattr(state, "add_order"):
+                state.add_order(placed_order)
+            else:
+                active_orders[new_order_id] = placed_order
 
     def _has_recent_fill(self) -> bool:
         """Avoid immediate repairs right after a genuine fill event."""
