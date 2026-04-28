@@ -28,7 +28,6 @@ CLAUDE.md
 .claude/
 
 README_old.md
-CHANGELOG.md
 AGENTS.md
 
 config/grid/tradexyz_long.yaml

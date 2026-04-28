@@ -265,6 +265,7 @@ class OrderHealthChecker:
 
                     if order_amount > 0 and abs(order_amount - effective_fill) <= tolerance:
                         self._clear_missing_order_tracking(alias_keys)
+                        self._note_finalized_order(*alias_keys, grid_order.order_id)
                         grid_order.mark_filled(filled_price, order_amount)
                         filled_orders.append(grid_order)
                         self._clear_pending_order_refs(grid_order, alias_keys)
@@ -276,11 +277,13 @@ class OrderHealthChecker:
                     grid_order,
                     filled_amount or grid_order.amount,
                 )
+                self._note_finalized_order(*alias_keys, grid_order.order_id)
                 grid_order.mark_filled(filled_price, finalized_amount)
                 filled_orders.append(grid_order)
                 self._clear_pending_order_refs(grid_order, alias_keys)
             elif status in {"canceled", "cancelled", "rejected", "expired"}:
                 self._clear_missing_order_tracking(alias_keys)
+                self._note_finalized_order(*alias_keys, grid_order.order_id)
                 grid_order.mark_cancelled()
                 self._clear_pending_order_refs(grid_order, alias_keys)
             else:
@@ -302,19 +305,14 @@ class OrderHealthChecker:
             order_id = getattr(ex_order, "id", None)
             if not order_id or order_id in self.engine._pending_orders:
                 continue
+            if self._was_recently_finalized_order(order_id):
+                continue
 
             try:
-                grid_id = self.config.get_grid_index_by_price(ex_order.price)
-                side = GridOrderSide.BUY if ex_order.side.value.lower() == "buy" else GridOrderSide.SELL
-                self.engine._pending_orders[order_id] = GridOrder(
-                    order_id=order_id,
-                    grid_id=grid_id,
-                    side=side,
-                    price=ex_order.price,
-                    amount=ex_order.amount,
-                    status=GridOrderStatus.PENDING,
-                    created_at=datetime.now(),
-                )
+                mirrored_order = self._build_grid_order_from_exchange_order(ex_order)
+                if mirrored_order is None:
+                    continue
+                self._register_engine_pending_order(mirrored_order, order_id, getattr(ex_order, "client_id", None))
             except Exception as exc:
                 self.logger.warning(f"Failed to mirror exchange order into local cache: {exc}")
 
@@ -379,8 +377,7 @@ class OrderHealthChecker:
             tracked_exchange_order_ids = [
                 order_id for order_id in local_order_ids if order_id in exchange_order_ids
             ]
-            allowed_count = max(len(tracked_exchange_order_ids), 1)
-            if len(orders) <= allowed_count:
+            if len(orders) <= 1:
                 continue
 
             keep_ids: set[str] = set()
@@ -391,14 +388,14 @@ class OrderHealthChecker:
                 if (
                     order_id
                     and order_id in tracked_id_set
-                    and len(keep_ids) < allowed_count
+                    and not keep_ids
                 ):
                     keep_ids.add(order_id)
 
             for order in orders:
                 raw_order_id = getattr(order, "id", None)
                 order_id = str(raw_order_id) if raw_order_id else None
-                if order_id and len(keep_ids) < allowed_count:
+                if order_id and not keep_ids:
                     keep_ids.add(order_id)
 
             for order in orders:
@@ -421,9 +418,15 @@ class OrderHealthChecker:
             for order in exchange_orders
             if getattr(order, "price", None) is not None
         }
+        base_side = self._base_side_for_grid_type()
         existing_grid_ids = {
             grid_id
             for order in exchange_orders
+            if (
+                base_side is not None
+                and getattr(order, "side", None) is not None
+                and order.side.value.lower() == base_side.value.lower()
+            )
             for grid_id in [self._grid_id_from_price(order.price)]
             if grid_id is not None
         }
@@ -1208,6 +1211,117 @@ class OrderHealthChecker:
         for key in alias_keys:
             if key in self.engine._expected_cancellations:
                 self.engine._expected_cancellations.remove(key)
+
+    def _register_engine_pending_order(
+        self,
+        grid_order: GridOrder,
+        *keys: Optional[str],
+    ) -> None:
+        """Register a mirrored exchange order in the engine cache."""
+        register = getattr(self.engine, "_register_pending_order", None)
+        if callable(register):
+            register(grid_order, *keys)
+            return
+
+        for key in keys:
+            if key:
+                self.engine._pending_orders[str(key)] = grid_order
+
+    def _build_grid_order_from_exchange_order(self, exchange_order: OrderData) -> Optional[GridOrder]:
+        """Convert an exchange open order into a local grid order without losing reverse-grid source."""
+        builder = getattr(self.engine, "_build_grid_order_from_exchange_order", None)
+        if callable(builder):
+            return builder(exchange_order)
+
+        order_id = getattr(exchange_order, "id", None)
+        price = getattr(exchange_order, "price", None)
+        amount = getattr(exchange_order, "amount", None)
+        side = getattr(exchange_order, "side", None)
+        if not order_id or price is None or amount is None or side is None:
+            return None
+
+        grid_side = (
+            GridOrderSide.BUY
+            if side.value.lower() == "buy"
+            else GridOrderSide.SELL
+        )
+        price = Decimal(str(price))
+        grid_id = self._infer_grid_id_for_exchange_order(price, grid_side)
+        if grid_id is None:
+            return None
+
+        parent_order_id = None
+        if self._is_reverse_side(grid_side):
+            parent_order_id = f"mirrored:{order_id}"
+
+        return GridOrder(
+            order_id=str(order_id),
+            grid_id=grid_id,
+            side=grid_side,
+            price=price,
+            amount=Decimal(str(amount)),
+            status=GridOrderStatus.PENDING,
+            created_at=datetime.now(),
+            parent_order_id=parent_order_id,
+            exchange_data={"mirrored_exchange_order": True},
+        )
+
+    def _infer_grid_id_for_exchange_order(
+        self,
+        price: Decimal,
+        side: GridOrderSide,
+    ) -> Optional[int]:
+        """Infer the logical source grid for imported base and reverse orders."""
+        if not self._is_reverse_side(side):
+            return self._grid_id_from_price(price)
+
+        source_price = self._source_price_for_reverse_order(price, side)
+        if source_price is None:
+            return self._grid_id_from_price(price)
+        return self._grid_id_from_price(source_price)
+
+    def _source_price_for_reverse_order(
+        self,
+        price: Decimal,
+        side: GridOrderSide,
+    ) -> Optional[Decimal]:
+        """Return the source grid price for an opposite-side reverse order."""
+        base_side = self._base_side_for_grid_type()
+        if base_side is None:
+            return None
+
+        distance = getattr(self.config, "reverse_order_grid_distance", 1) or 1
+        try:
+            offset = self.config.grid_interval * Decimal(str(distance))
+        except Exception:
+            return None
+
+        if base_side == GridOrderSide.BUY and side == GridOrderSide.SELL:
+            return price - offset
+        if base_side == GridOrderSide.SELL and side == GridOrderSide.BUY:
+            return price + offset
+        return None
+
+    def _is_reverse_side(self, side: GridOrderSide) -> bool:
+        """Return whether an order side is opposite to the configured base side."""
+        base_side = self._base_side_for_grid_type()
+        return base_side is not None and side != base_side
+
+    def _note_finalized_order(self, *keys: Optional[str]) -> None:
+        """Ask the engine to remember finalized order ids for stale-snapshot filtering."""
+        notifier = getattr(self.engine, "_note_finalized_order", None)
+        if callable(notifier):
+            notifier(*keys)
+
+    def _was_recently_finalized_order(self, key: Optional[str]) -> bool:
+        """Return whether the engine recently finalized this order id."""
+        checker = getattr(self.engine, "_was_recently_finalized_order", None)
+        if callable(checker):
+            try:
+                return bool(checker(key))
+            except Exception:
+                return False
+        return False
 
     async def _restore_missing_order_if_timed_out(
         self,

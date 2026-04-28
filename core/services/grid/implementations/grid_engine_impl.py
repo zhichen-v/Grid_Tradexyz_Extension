@@ -60,6 +60,8 @@ class GridEngineImpl(IGridEngine):
         self._exchange_sync_grace_period: float = 5.0
         self._missing_order_resolution_timeout: float = 8.0
         self._health_repairs_suspended_reason: Optional[str] = None
+        self._recently_finalized_order_ids: Dict[str, float] = {}
+        self._finalized_order_cache_seconds: float = 300.0
 
         exchange_id = getattr(exchange_adapter.config, "exchange_id", "unknown")
         self.logger.info(f"Grid execution engine initialized for {exchange_id}")
@@ -821,11 +823,13 @@ class GridEngineImpl(IGridEngine):
                         grid_order,
                         exchange_order.filled or grid_order.amount,
                     )
+                    self._note_finalized_order(*aliases)
                     grid_order.mark_filled(filled_price, filled_amount)
                     self._clear_pending_order_refs(*aliases)
                     filled_in_sync.append(grid_order)
                     removed_count += 1
                 elif status in {"canceled", "cancelled", "rejected", "expired"}:
+                    self._note_finalized_order(*aliases)
                     grid_order.mark_cancelled()
                     self._clear_pending_order_refs(*aliases)
                     removed_count += 1
@@ -847,22 +851,15 @@ class GridEngineImpl(IGridEngine):
                 side = getattr(exchange_order, "side", None)
                 if not order_id or price is None or amount is None or side is None:
                     continue
+                if self._was_recently_finalized_order(order_id) or (
+                    client_id and self._was_recently_finalized_order(client_id)
+                ):
+                    continue
 
                 try:
-                    grid_side = (
-                        GridOrderSide.BUY
-                        if side.value.lower() == "buy"
-                        else GridOrderSide.SELL
-                    )
-                    grid_order = GridOrder(
-                        order_id=order_id,
-                        grid_id=self.config.get_grid_index_by_price(price),
-                        side=grid_side,
-                        price=price,
-                        amount=amount,
-                        status=GridOrderStatus.PENDING,
-                        created_at=datetime.now(),
-                    )
+                    grid_order = self._build_grid_order_from_exchange_order(exchange_order)
+                    if grid_order is None:
+                        continue
                     self._register_pending_order(grid_order, order_id, client_id)
                     added_count += 1
                 except Exception as exc:
@@ -1307,6 +1304,7 @@ class GridEngineImpl(IGridEngine):
         *keys: Optional[str],
     ):
         """Mark an order as filled, remove it from cache, and trigger callbacks."""
+        self._note_finalized_order(*keys, grid_order.order_id)
         grid_order.mark_filled(filled_price, filled_amount)
         self._clear_pending_order_refs(*keys)
         self.logger.info(
@@ -1323,6 +1321,7 @@ class GridEngineImpl(IGridEngine):
         *keys: Optional[str],
     ):
         """Remove a cancelled order and restore it when the cancel was unexpected."""
+        self._note_finalized_order(*keys, grid_order.order_id)
         self._clear_pending_order_refs(*keys)
         if self._consume_expected_cancellation(*keys):
             self.logger.info(
@@ -1372,6 +1371,122 @@ class GridEngineImpl(IGridEngine):
             normalized = self._string_or_none(key)
             if normalized:
                 self._pending_orders[normalized] = grid_order
+
+    def _build_grid_order_from_exchange_order(
+        self,
+        exchange_order: ExchangeOrderData,
+    ) -> Optional[GridOrder]:
+        """Convert an exchange open order into a locally tracked grid order."""
+        order_id = self._string_or_none(getattr(exchange_order, "id", None))
+        price = getattr(exchange_order, "price", None)
+        amount = getattr(exchange_order, "amount", None)
+        side = getattr(exchange_order, "side", None)
+        if not order_id or price is None or amount is None or side is None:
+            return None
+
+        grid_side = (
+            GridOrderSide.BUY
+            if side.value.lower() == "buy"
+            else GridOrderSide.SELL
+        )
+        grid_id = self._infer_grid_id_for_exchange_order(Decimal(str(price)), grid_side)
+        if grid_id is None:
+            return None
+
+        parent_order_id = None
+        if self._is_reverse_side(grid_side):
+            parent_order_id = f"mirrored:{order_id}"
+
+        return GridOrder(
+            order_id=order_id,
+            grid_id=grid_id,
+            side=grid_side,
+            price=Decimal(str(price)),
+            amount=Decimal(str(amount)),
+            status=GridOrderStatus.PENDING,
+            created_at=datetime.now(),
+            parent_order_id=parent_order_id,
+            exchange_data={"mirrored_exchange_order": True},
+        )
+
+    def _infer_grid_id_for_exchange_order(
+        self,
+        price: Decimal,
+        side: GridOrderSide,
+    ) -> Optional[int]:
+        """Infer the logical source grid for base and reverse exchange orders."""
+        if self.config is None:
+            return None
+
+        if not self._is_reverse_side(side):
+            return self.config.get_grid_index_by_price(price)
+
+        source_price = self._source_price_for_reverse_order(price, side)
+        if source_price is None:
+            return self.config.get_grid_index_by_price(price)
+        return self.config.get_grid_index_by_price(source_price)
+
+    def _source_price_for_reverse_order(
+        self,
+        price: Decimal,
+        side: GridOrderSide,
+    ) -> Optional[Decimal]:
+        """Return the source grid price for an opposite-side reverse order."""
+        base_side = self._base_side_for_grid_type()
+        if base_side is None:
+            return None
+
+        distance = getattr(self.config, "reverse_order_grid_distance", 1) or 1
+        offset = self.config.grid_interval * Decimal(str(distance))
+        if base_side == GridOrderSide.BUY and side == GridOrderSide.SELL:
+            return price - offset
+        if base_side == GridOrderSide.SELL and side == GridOrderSide.BUY:
+            return price + offset
+        return None
+
+    def _base_side_for_grid_type(self) -> Optional[GridOrderSide]:
+        """Return the opening side for the configured grid type."""
+        if self.config is None:
+            return None
+
+        grid_type = getattr(self.config, "grid_type", None)
+        value = getattr(grid_type, "value", str(grid_type)).lower()
+        if value in {"long", "follow_long", "martingale_long"}:
+            return GridOrderSide.BUY
+        if value in {"short", "follow_short", "martingale_short"}:
+            return GridOrderSide.SELL
+        return None
+
+    def _is_reverse_side(self, side: GridOrderSide) -> bool:
+        """Return whether an order side is opposite to the configured base side."""
+        base_side = self._base_side_for_grid_type()
+        return base_side is not None and side != base_side
+
+    def _note_finalized_order(self, *keys: Optional[str]) -> None:
+        """Remember recently finalized order ids so stale snapshots are not re-imported."""
+        self._prune_recently_finalized_orders()
+        now = time.time()
+        for key in keys:
+            normalized = self._string_or_none(key)
+            if normalized:
+                self._recently_finalized_order_ids[normalized] = now
+
+    def _was_recently_finalized_order(self, key: Optional[str]) -> bool:
+        """Return whether an order id was finalized recently enough to ignore stale open snapshots."""
+        normalized = self._string_or_none(key)
+        if not normalized:
+            return False
+        self._prune_recently_finalized_orders()
+        return normalized in self._recently_finalized_order_ids
+
+    def _prune_recently_finalized_orders(self) -> None:
+        """Drop old finalized-order ids from the stale-snapshot guard."""
+        if not self._recently_finalized_order_ids:
+            return
+        cutoff = time.time() - self._finalized_order_cache_seconds
+        for key, seen_at in list(self._recently_finalized_order_ids.items()):
+            if seen_at < cutoff:
+                del self._recently_finalized_order_ids[key]
 
     def _pending_keys_for_order(self, grid_order: GridOrder) -> List[str]:
         """Return all cache keys that point to the provided GridOrder object."""
