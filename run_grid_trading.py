@@ -61,6 +61,32 @@ def _wallet_profile_path(wallet_name: str) -> Path:
     return WALLET_PROFILES_DIR / f"{_validate_wallet_name(wallet_name)}.env"
 
 
+def _apply_wallet_shortcut(
+    args: argparse.Namespace,
+    unknown_args: list[str],
+    parser: argparse.ArgumentParser,
+) -> argparse.Namespace:
+    """Treat one unknown --<name> argument as a wallet profile shortcut."""
+    if not unknown_args:
+        return args
+
+    if len(unknown_args) != 1:
+        parser.error(f"unrecognized arguments: {' '.join(unknown_args)}")
+
+    wallet_arg = unknown_args[0]
+    if not wallet_arg.startswith("--") or wallet_arg == "--" or "=" in wallet_arg:
+        parser.error(f"unrecognized argument: {wallet_arg}")
+
+    shortcut_name = _validate_wallet_name(wallet_arg[2:])
+    if args.wallet_name and args.wallet_name != shortcut_name:
+        parser.error(
+            f"wallet profile was provided twice: {args.wallet_name} and {shortcut_name}"
+        )
+
+    args.wallet_name = shortcut_name
+    return args
+
+
 def resolve_config_path(config_path: str) -> str:
     """Resolve a config path, accepting bare file names from config/grid."""
     requested_path = Path(config_path)
@@ -816,7 +842,7 @@ Examples:
   python3 run_grid_trading.py config/grid/lighter_btc_perp_long.yaml --debug
 
   # TradeXYZ with a config filename and named agent wallet profile
-  python3 run_grid_trading.py tradexyz_NVDA_long.yaml --wallet-name nvda01
+  python3 run_grid_trading.py tradexyz_NVDA_long.yaml --nvda01
 
 Supported exchanges:
   Backpack    - Perpetual markets (long / short)
@@ -832,7 +858,7 @@ Notes:
   5. The grid system runs continuously until it is stopped manually.
   6. Use Ctrl+C or Q to exit safely.
   7. DEBUG mode prints detailed logs for troubleshooting.
-  8. Named wallet profiles are loaded from .env.wallets/<name>.env.
+  8. Named wallet profiles can be selected with --<name>, for example --main.
         """,
     )
 
@@ -853,7 +879,7 @@ Notes:
         "--walletname",
         dest="wallet_name",
         type=_validate_wallet_name,
-        help="Use a named wallet profile from .env.wallets/<name>.env",
+        help="Use a named wallet profile from .env.wallets/<name>.env (legacy form; prefer --<name>)",
     )
 
     parser.add_argument(
@@ -862,7 +888,8 @@ Notes:
         version="Grid Trading System v2.0.0",
     )
 
-    return parser.parse_args()
+    args, unknown_args = parser.parse_known_args()
+    return _apply_wallet_shortcut(args, unknown_args, parser)
 
 
 if __name__ == "__main__":

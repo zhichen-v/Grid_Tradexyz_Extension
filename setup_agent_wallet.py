@@ -13,7 +13,7 @@ Agent Wallet 安全模型:
 
 執行方式:
     uv run python setup_agent_wallet.py
-    uv run python setup_agent_wallet.py --wallet-name nvda01
+    uv run python setup_agent_wallet.py --nvda01
 
 前置條件:
   - 主錢包必須已在 Hyperliquid 存入過資金（帳戶需存在）
@@ -56,6 +56,34 @@ def get_wallet_env_path(wallet_name: str | None) -> Path:
     if wallet_name:
         return WALLET_PROFILES_DIR / f"{validate_wallet_name(wallet_name)}.env"
     return ENV_PATH
+
+
+def apply_wallet_shortcut(
+    args: argparse.Namespace,
+    unknown_args: list[str],
+    parser: argparse.ArgumentParser,
+) -> argparse.Namespace:
+    """
+    Treat one unknown --<name> argument as a wallet profile shortcut.
+    """
+    if not unknown_args:
+        return args
+
+    if len(unknown_args) != 1:
+        parser.error(f"unrecognized arguments: {' '.join(unknown_args)}")
+
+    wallet_arg = unknown_args[0]
+    if not wallet_arg.startswith("--") or wallet_arg == "--" or "=" in wallet_arg:
+        parser.error(f"unrecognized argument: {wallet_arg}")
+
+    shortcut_name = validate_wallet_name(wallet_arg[2:])
+    if args.wallet_name and args.wallet_name != shortcut_name:
+        parser.error(
+            f"wallet profile was provided twice: {args.wallet_name} and {shortcut_name}"
+        )
+
+    args.wallet_name = shortcut_name
+    return args
 
 
 # ─── 步驟 1: 取得主錢包私鑰 ────────────────────────────────────────────────
@@ -243,10 +271,10 @@ Examples:
   uv run python setup_agent_wallet.py
 
   # Create a named wallet profile
-  uv run python setup_agent_wallet.py --wallet-name nvda01
+  uv run python setup_agent_wallet.py --nvda01
 
 Then run:
-  uv run python run_grid_trading.py tradexyz_NVDA_long.yaml --wallet-name nvda01
+  uv run python run_grid_trading.py tradexyz_NVDA_long.yaml --nvda01
         """,
     )
     parser.add_argument(
@@ -254,14 +282,15 @@ Then run:
         "--walletname",
         dest="wallet_name",
         type=validate_wallet_name,
-        help="Save credentials to .env.wallets/<name>.env instead of .env",
+        help="Save credentials to .env.wallets/<name>.env instead of .env (legacy form; prefer --<name>)",
     )
     parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Allow replacing an existing named wallet profile",
     )
-    return parser.parse_args()
+    args, unknown_args = parser.parse_known_args()
+    return apply_wallet_shortcut(args, unknown_args, parser)
 
 
 def main():
@@ -324,7 +353,7 @@ def main():
     print("=" * 60)
     grid_command = "uv run python run_grid_trading.py tradexyz_NVDA_long.yaml"
     if wallet_name:
-        grid_command = f"{grid_command} --wallet-name {wallet_name}"
+        grid_command = f"{grid_command} --{wallet_name}"
 
     print(f"""
 後續使用方式:

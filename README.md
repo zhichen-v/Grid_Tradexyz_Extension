@@ -128,11 +128,11 @@ You can place these in a local `.env` file. The repository already ignores `.env
 For multiple TradeXYZ accounts, create one profile per main EVM wallet:
 
 ```bash
-uv run python setup_agent_wallet.py --wallet-name nvda01
-uv run python setup_agent_wallet.py --wallet-name nvda02
+uv run python setup_agent_wallet.py --nvda01
+uv run python setup_agent_wallet.py --nvda02
 ```
 
-Each profile is saved under `.env.wallets/<name>.env` and contains the agent key plus the corresponding main wallet address. Existing named profiles are not overwritten unless you pass `--overwrite`.
+Each profile is saved under `.env.wallets/<name>.env` and contains the agent key plus the corresponding main wallet address. Existing named profiles are not overwritten unless you pass `--overwrite`. The legacy `--wallet-name <name>` form is still accepted, but `--<name>` is preferred.
 
 ## 7. Optional: Create a TradeXYZ Agent Wallet
 
@@ -152,7 +152,7 @@ What this script does:
 For multiple accounts, prefer named profiles:
 
 ```bash
-uv run python setup_agent_wallet.py --wallet-name nvda01
+uv run python setup_agent_wallet.py --nvda01
 ```
 
 Use this only if you understand your exchange account model and want the runtime to trade through an agent wallet instead of the main wallet key.
@@ -263,7 +263,8 @@ uv run python run_grid_trading.py tradexyz_test_follow_long.yaml
 To run with a named TradeXYZ wallet profile:
 
 ```bash
-uv run python run_grid_trading.py tradexyz_NVDA_long.yaml --wallet-name nvda01
+uv run python run_grid_trading.py tradexyz_NVDA_long.yaml --main
+uv run python run_grid_trading.py tradexyz_NVDA_long.yaml --nvda01
 ```
 
 What the startup flow does:
@@ -303,7 +304,7 @@ These scripts may hit real exchange endpoints. Do not run them with production c
 
 ## 12. Logs and Runtime Output
 
-Runtime logs are written under `logs/`. Runs without a named wallet use `logs/<symbol>/`. Runs with `--wallet-name` use `logs/<wallet>/<symbol>/`, which keeps multiple terminals on the same symbol from clearing each other's logs.
+Runtime logs are written under `logs/`. Runs without a named wallet use `logs/<symbol>/`. Runs with a wallet shortcut such as `--main` use `logs/<wallet>/<symbol>/`, which keeps multiple terminals on the same symbol from clearing each other's logs.
 
 Useful places to look when debugging:
 
@@ -330,7 +331,7 @@ Bare filenames are resolved under `config/grid/`.
 
 The runtime checks:
 
-1. Named wallet profile from `.env.wallets/<name>.env`, when `--wallet-name` is provided
+1. Named wallet profile from `.env.wallets/<name>.env`, when a wallet shortcut such as `--main` is provided
 2. Environment variables / `.env`
 3. `config/exchanges/<exchange>_config.yaml`
 
@@ -338,10 +339,10 @@ If all sources are empty, startup continues far enough to print warnings but tra
 
 ### Wallet profile not found
 
-You passed `--wallet-name`, but `.env.wallets/<name>.env` does not exist. Create it first:
+You passed a wallet shortcut such as `--main`, but `.env.wallets/<name>.env` does not exist. Create it first:
 
 ```bash
-uv run python setup_agent_wallet.py --wallet-name nvda01
+uv run python setup_agent_wallet.py --nvda01
 ```
 
 ### Spot market does not support short mode
