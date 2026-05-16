@@ -25,6 +25,7 @@ from core.logging.logger import LineLimitedFileHandler
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
+GRID_CONFIG_DIR = Path("config/grid")
 WALLET_PROFILES_DIR = Path(".env.wallets")
 
 
@@ -58,6 +59,20 @@ def _available_wallet_profiles() -> list[str]:
 def _wallet_profile_path(wallet_name: str) -> Path:
     """Return the env file path for a validated wallet profile name."""
     return WALLET_PROFILES_DIR / f"{_validate_wallet_name(wallet_name)}.env"
+
+
+def resolve_config_path(config_path: str) -> str:
+    """Resolve a config path, accepting bare file names from config/grid."""
+    requested_path = Path(config_path)
+    if requested_path.exists():
+        return str(requested_path)
+
+    if not requested_path.is_absolute() and len(requested_path.parts) == 1:
+        grid_path = GRID_CONFIG_DIR / requested_path
+        if grid_path.exists():
+            return str(grid_path)
+
+    return str(requested_path)
 
 
 async def load_config(config_path: str) -> dict:
@@ -800,13 +815,14 @@ Examples:
   # Lighter exchange
   python3 run_grid_trading.py config/grid/lighter_btc_perp_long.yaml --debug
 
-  # TradeXYZ with a named agent wallet profile
-  python3 run_grid_trading.py config/grid/tradexyz_NVDA_long.yaml --wallet-name nvda01
+  # TradeXYZ with a config filename and named agent wallet profile
+  python3 run_grid_trading.py tradexyz_NVDA_long.yaml --wallet-name nvda01
 
 Supported exchanges:
   Backpack    - Perpetual markets (long / short)
   Hyperliquid - Perpetual markets (long / short), spot (long only)
   Lighter     - Perpetual markets (long / short)
+  TradeXYZ    - Perpetual markets through Hyperliquid DEX support
 
 Notes:
   1. Make sure API credentials are configured correctly.
@@ -823,7 +839,7 @@ Notes:
     parser.add_argument(
         "config",
         type=str,
-        help="Grid config file path (for example: config/grid/lighter_btc_perp_long.yaml)",
+        help="Grid config file path or filename under config/grid",
     )
 
     parser.add_argument(
@@ -855,14 +871,24 @@ if __name__ == "__main__":
         args = parse_arguments()
 
         # Resolve the config path.
-        config_path = args.config
+        config_path = resolve_config_path(args.config)
         wallet_name = args.wallet_name
 
         # Ensure the config file exists before startup.
         if not Path(config_path).exists():
-            print(f"Config file does not exist: {config_path}")
+            print(f"Config file does not exist: {args.config}")
+            requested_path = Path(args.config)
+            if not requested_path.is_absolute() and len(requested_path.parts) == 1:
+                print(f"Also checked: {GRID_CONFIG_DIR / requested_path}")
+            elif args.config == config_path:
+                print("Tried the provided path directly.")
+            else:
+                print(f"Resolved path was: {config_path}")
             print("\nUse -h or --help to view usage")
             sys.exit(1)
+
+        if config_path != args.config:
+            print(f"Resolved config file: {config_path}")
 
         # Print a short debug summary before startup.
         if args.debug:
@@ -884,7 +910,7 @@ if __name__ == "__main__":
         print("\nProgram exited")
     except SystemExit:
         # argparse --help and --version trigger SystemExit intentionally.
-        pass
+        raise
     except WalletProfileError as exc:
         print(f"\nStartup failed: {exc}")
         sys.exit(1)

@@ -75,6 +75,9 @@
 
 - Added named TradeXYZ agent wallet profiles: `setup_agent_wallet.py --wallet-name <name>` now writes `.env.wallets/<name>.env` without overwriting existing named profiles unless `--overwrite` is passed, and `run_grid_trading.py --wallet-name <name>` loads that profile explicitly for grid startup.
 - Isolated wallet-profile runtime logs under `logs/<wallet>/<symbol>/` so multiple terminals using different wallets can run the same symbol without clearing each other's logs.
+- Allowed `run_grid_trading.py` to accept bare grid config filenames such as `tradexyz_NVDA_long.yaml` and resolve them from `config/grid/`, while preserving full-path support.
+- Updated `README.md` and `AGENTS.md` with named wallet profile usage, shortened grid config invocation, and wallet-profile credential safety notes.
+- Preserved non-zero process exits for startup validation failures while keeping `--help` and `--version` behavior intact.
 
 #### 2026-04-26
 
@@ -109,6 +112,8 @@
 - 2026-05-16: `uv run python run_grid_trading.py --help`
 - 2026-05-16: `uv run python setup_agent_wallet.py --help`
 - 2026-05-16: `uv run python run_grid_trading.py config/grid/tradexyz_test_follow_long.yaml --wallet-name missing_profile_check`
+- 2026-05-16: `uv run python run_grid_trading.py tradexyz_test_follow_long.yaml --wallet-name missing_profile_check`
+- 2026-05-16: `uv run python run_grid_trading.py does_not_exist.yaml`
 
 - `Get-Content -Raw -Encoding UTF8 config\grid\README.md`
 

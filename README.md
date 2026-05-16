@@ -86,7 +86,7 @@ The main runtime dependencies include:
 
 ## 6. Configure Exchange Credentials
 
-There are two practical ways to provide credentials.
+There are three practical ways to provide credentials.
 
 ### Option A: Put credentials in the exchange config file
 
@@ -123,6 +123,17 @@ HL_AGENT_ADDRESS=0xYOUR_AGENT_ADDRESS
 
 You can place these in a local `.env` file. The repository already ignores `.env`, so it should not be committed.
 
+### Option C: Use named TradeXYZ agent wallet profiles
+
+For multiple TradeXYZ accounts, create one profile per main EVM wallet:
+
+```bash
+uv run python setup_agent_wallet.py --wallet-name nvda01
+uv run python setup_agent_wallet.py --wallet-name nvda02
+```
+
+Each profile is saved under `.env.wallets/<name>.env` and contains the agent key plus the corresponding main wallet address. Existing named profiles are not overwritten unless you pass `--overwrite`.
+
 ## 7. Optional: Create a TradeXYZ Agent Wallet
 
 If your TradeXYZ flow uses an agent wallet, run:
@@ -137,6 +148,12 @@ What this script does:
 - Approves a new agent wallet through the Hyperliquid / TradeXYZ flow
 - Writes agent credentials into `.env`
 - Clears the raw private key from `config/exchanges/tradexyz_config.yaml`
+
+For multiple accounts, prefer named profiles:
+
+```bash
+uv run python setup_agent_wallet.py --wallet-name nvda01
+```
 
 Use this only if you understand your exchange account model and want the runtime to trade through an agent wallet instead of the main wallet key.
 
@@ -227,13 +244,26 @@ Common `grid_type` values:
 Normal mode:
 
 ```bash
-uv run python run_grid_trading.py config/grid/tradexyz_test_follow_long.yaml
+uv run python run_grid_trading.py tradexyz_test_follow_long.yaml
 ```
 
 Debug mode:
 
 ```bash
-uv run python run_grid_trading.py config/grid/tradexyz_test_follow_long.yaml --debug
+uv run python run_grid_trading.py tradexyz_test_follow_long.yaml --debug
+```
+
+`run_grid_trading.py` accepts either the full path or a bare filename from `config/grid/`. These two commands are equivalent:
+
+```bash
+uv run python run_grid_trading.py config/grid/tradexyz_test_follow_long.yaml
+uv run python run_grid_trading.py tradexyz_test_follow_long.yaml
+```
+
+To run with a named TradeXYZ wallet profile:
+
+```bash
+uv run python run_grid_trading.py tradexyz_NVDA_long.yaml --wallet-name nvda01
 ```
 
 What the startup flow does:
@@ -273,7 +303,7 @@ These scripts may hit real exchange endpoints. Do not run them with production c
 
 ## 12. Logs and Runtime Output
 
-Runtime logs are written under `logs/`.
+Runtime logs are written under `logs/`. Runs without a named wallet use `logs/<symbol>/`. Runs with `--wallet-name` use `logs/<wallet>/<symbol>/`, which keeps multiple terminals on the same symbol from clearing each other's logs.
 
 Useful places to look when debugging:
 
@@ -291,17 +321,28 @@ If you need more detail, rerun with `--debug`.
 You passed a path that `run_grid_trading.py` cannot find. Use a relative path from the repo root, for example:
 
 ```bash
-uv run python run_grid_trading.py config/grid/tradexyz_test_follow_long.yaml
+uv run python run_grid_trading.py tradexyz_test_follow_long.yaml
 ```
+
+Bare filenames are resolved under `config/grid/`.
 
 ### Credentials were not found
 
 The runtime checks:
 
-1. Environment variables / `.env`
-2. `config/exchanges/<exchange>_config.yaml`
+1. Named wallet profile from `.env.wallets/<name>.env`, when `--wallet-name` is provided
+2. Environment variables / `.env`
+3. `config/exchanges/<exchange>_config.yaml`
 
-If both are empty, startup continues far enough to print warnings but trading cannot work correctly.
+If all sources are empty, startup continues far enough to print warnings but trading cannot work correctly.
+
+### Wallet profile not found
+
+You passed `--wallet-name`, but `.env.wallets/<name>.env` does not exist. Create it first:
+
+```bash
+uv run python setup_agent_wallet.py --wallet-name nvda01
+```
 
 ### Spot market does not support short mode
 
@@ -339,6 +380,7 @@ grid1.3/
 ## 15. Security Notes
 
 - Do not commit private keys, wallet addresses, or `.env` secrets.
+- Do not commit `.env.wallets/`; each file contains a live agent trading key.
 - Start with small size and non-critical capital.
 - Treat all order-placement scripts as potentially live.
 - Review your config carefully before running any grid strategy.
@@ -352,6 +394,6 @@ If you just want to confirm the repository works end to end, this is the shortes
 3. Run `uv pip install -r requirements.txt`
 4. Fill in `config/exchanges/tradexyz_config.yaml`
 5. Review `config/grid/tradexyz_test_follow_long.yaml`
-6. Run `uv run python run_grid_trading.py config/grid/tradexyz_test_follow_long.yaml --debug`
+6. Run `uv run python run_grid_trading.py tradexyz_test_follow_long.yaml --debug`
 
 If that starts cleanly and the TUI appears, your environment is set up correctly.

@@ -246,7 +246,7 @@ Examples:
   uv run python setup_agent_wallet.py --wallet-name nvda01
 
 Then run:
-  uv run python run_grid_trading.py config/grid/tradexyz_NVDA_long.yaml --wallet-name nvda01
+  uv run python run_grid_trading.py tradexyz_NVDA_long.yaml --wallet-name nvda01
         """,
     )
     parser.add_argument(
@@ -322,7 +322,7 @@ def main():
     print("\n" + "=" * 60)
     print("  授權完成！")
     print("=" * 60)
-    grid_command = "uv run python run_grid_trading.py config/grid/tradexyz_NVDA_long.yaml"
+    grid_command = "uv run python run_grid_trading.py tradexyz_NVDA_long.yaml"
     if wallet_name:
         grid_command = f"{grid_command} --wallet-name {wallet_name}"
 
