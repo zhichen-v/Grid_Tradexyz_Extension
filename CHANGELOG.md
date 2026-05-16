@@ -71,6 +71,11 @@
 
 ### Changed
 
+#### 2026-05-16
+
+- Added named TradeXYZ agent wallet profiles: `setup_agent_wallet.py --wallet-name <name>` now writes `.env.wallets/<name>.env` without overwriting existing named profiles unless `--overwrite` is passed, and `run_grid_trading.py --wallet-name <name>` loads that profile explicitly for grid startup.
+- Isolated wallet-profile runtime logs under `logs/<wallet>/<symbol>/` so multiple terminals using different wallets can run the same symbol without clearing each other's logs.
+
 #### 2026-04-26
 
 - Rewrote `config/grid/README.md` into a clean UTF-8 configuration guide, removing garbled text and expanding the documentation to match the current runtime-supported grid, protection, and nested YAML settings.
@@ -99,6 +104,11 @@
 - Strengthened health-check validation so success is no longer inferred from order-count parity alone.
 
 ### Validation
+
+- 2026-05-16: `.\.venv\Scripts\python.exe -m py_compile setup_agent_wallet.py run_grid_trading.py`
+- 2026-05-16: `uv run python run_grid_trading.py --help`
+- 2026-05-16: `uv run python setup_agent_wallet.py --help`
+- 2026-05-16: `uv run python run_grid_trading.py config/grid/tradexyz_test_follow_long.yaml --wallet-name missing_profile_check`
 
 - `Get-Content -Raw -Encoding UTF8 config\grid\README.md`
 

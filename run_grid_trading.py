@@ -25,6 +25,40 @@ from core.logging.logger import LineLimitedFileHandler
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
+WALLET_PROFILES_DIR = Path(".env.wallets")
+
+
+class WalletProfileError(RuntimeError):
+    """Raised when a named wallet profile cannot be loaded."""
+
+
+def _sanitize_path_segment(value: str, fallback: str = "default") -> str:
+    """Return a filesystem-safe single path segment."""
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-")
+    return sanitized or fallback
+
+
+def _validate_wallet_name(wallet_name: str) -> str:
+    """Validate a wallet profile name before using it as a file name."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", wallet_name):
+        raise ValueError(
+            "Wallet name must start with a letter or number and contain only "
+            "letters, numbers, dots, underscores, or hyphens."
+        )
+    return wallet_name
+
+
+def _available_wallet_profiles() -> list[str]:
+    """Return wallet profile names available under .env.wallets."""
+    if not WALLET_PROFILES_DIR.exists():
+        return []
+    return sorted(path.stem for path in WALLET_PROFILES_DIR.glob("*.env"))
+
+
+def _wallet_profile_path(wallet_name: str) -> Path:
+    """Return the env file path for a validated wallet profile name."""
+    return WALLET_PROFILES_DIR / f"{_validate_wallet_name(wallet_name)}.env"
+
 
 async def load_config(config_path: str) -> dict:
     """
@@ -45,13 +79,17 @@ async def load_config(config_path: str) -> dict:
         raise
 
 
-def build_grid_log_dir(config_data: dict) -> str:
+def build_grid_log_dir(config_data: dict, wallet_name: str | None = None) -> str:
     """Return the per-symbol log directory for one grid runtime."""
     grid_config = config_data.get("grid_system", {})
     raw_symbol = str(grid_config.get("symbol", "")).strip()
-    sanitized_symbol = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_symbol).strip("._-")
-    folder_name = sanitized_symbol or "default"
-    return str(Path("logs") / folder_name)
+    symbol_folder = _sanitize_path_segment(raw_symbol)
+
+    if wallet_name:
+        wallet_folder = _sanitize_path_segment(_validate_wallet_name(wallet_name))
+        return str(Path("logs") / wallet_folder / symbol_folder)
+
+    return str(Path("logs") / symbol_folder)
 
 
 def create_grid_config(config_data: dict) -> GridConfig:
@@ -219,22 +257,64 @@ def detect_market_type(symbol: str, exchange_name: str) -> ExchangeType:
     return ExchangeType.PERPETUAL
 
 
-def _load_dotenv() -> None:
-    """Load environment variables from `.env` without overwriting existing values."""
-    import os
-
-    env_path = Path(".env")
-    if not env_path.exists():
-        return
+def _read_env_file(env_path: Path) -> dict[str, str]:
+    """Read simple KEY=VALUE entries from an env file."""
+    values: dict[str, str] = {}
 
     for line in env_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             key, _, value = line.partition("=")
-            os.environ.setdefault(key.strip(), value.strip())
+            key = key.strip()
+            value = value.strip()
+            if (
+                len(value) >= 2
+                and value[0] == value[-1]
+                and value[0] in {"'", '"'}
+            ):
+                value = value[1:-1]
+            values[key] = value
+
+    return values
 
 
-async def create_exchange_adapter(config_data: dict):
+def _load_dotenv(wallet_name: str | None = None) -> Path | None:
+    """Load credentials from a named wallet profile or from the default `.env`."""
+    import os
+
+    if wallet_name:
+        env_path = _wallet_profile_path(wallet_name)
+        if not env_path.exists():
+            available = ", ".join(_available_wallet_profiles()) or "(none)"
+            raise WalletProfileError(
+                f"Wallet profile not found: {wallet_name}. "
+                f"Expected file: {env_path}. Available profiles: {available}"
+            )
+
+        values = _read_env_file(env_path)
+        required_keys = {"HL_AGENT_KEY", "HL_WALLET_ADDRESS"}
+        missing_keys = sorted(key for key in required_keys if not values.get(key))
+        if missing_keys:
+            raise WalletProfileError(
+                f"Wallet profile {wallet_name} is missing required keys: "
+                f"{', '.join(missing_keys)}"
+            )
+
+        for key, value in values.items():
+            os.environ[key] = value
+        return env_path
+
+    env_path = Path(".env")
+    if not env_path.exists():
+        return None
+
+    for key, value in _read_env_file(env_path).items():
+        os.environ.setdefault(key, value)
+
+    return env_path
+
+
+async def create_exchange_adapter(config_data: dict, wallet_name: str | None = None):
     """
     Create and connect the exchange adapter.
 
@@ -251,8 +331,10 @@ async def create_exchange_adapter(config_data: dict):
     exchange_name = grid_config["exchange"].lower()
     symbol = grid_config["symbol"]
 
-    # Load additional credentials from .env, such as agent wallet keys.
-    _load_dotenv()
+    # Load additional credentials from .env or a named wallet profile.
+    wallet_env_path = _load_dotenv(wallet_name)
+    if wallet_name:
+        print(f"   - Wallet profile: {wallet_name} ({wallet_env_path})")
 
     # Detect spot vs perpetual automatically.
     market_type = detect_market_type(symbol, exchange_name)
@@ -268,15 +350,24 @@ async def create_exchange_adapter(config_data: dict):
         api_secret = api_secret or api_key
 
     # TradeXYZ additionally supports HL_AGENT_KEY / HL_WALLET_ADDRESS.
+    # A named wallet profile is explicit and overrides any stale shell vars.
     if exchange_name == "tradexyz":
         hl_agent_key = os.getenv("HL_AGENT_KEY")
         hl_wallet_address = os.getenv("HL_WALLET_ADDRESS")
-        if hl_agent_key and not api_key:
-            api_key = hl_agent_key
-            api_secret = hl_agent_key
-            print("   - Using HL_AGENT_KEY (Agent Wallet)")
-        if hl_wallet_address and not wallet_address:
-            wallet_address = hl_wallet_address
+        if wallet_name:
+            if hl_agent_key:
+                api_key = hl_agent_key
+                api_secret = hl_agent_key
+                print(f"   - Using HL_AGENT_KEY from wallet profile: {wallet_name}")
+            if hl_wallet_address:
+                wallet_address = hl_wallet_address
+        else:
+            if hl_agent_key and not api_key:
+                api_key = hl_agent_key
+                api_secret = hl_agent_key
+                print("   - Using HL_AGENT_KEY (Agent Wallet)")
+            if hl_wallet_address and not wallet_address:
+                wallet_address = hl_wallet_address
 
     # Fall back to the exchange config file if env vars are not set.
     if not api_key or not api_secret:
@@ -412,7 +503,9 @@ async def create_exchange_adapter(config_data: dict):
 
 
 async def main(
-    config_path: str = "config/grid/default_grid.yaml", debug: bool = False
+    config_path: str = "config/grid/default_grid.yaml",
+    debug: bool = False,
+    wallet_name: str | None = None,
 ) -> None:
     """
     Main entrypoint.
@@ -420,10 +513,13 @@ async def main(
     Args:
         config_path: Configuration file path.
         debug: Whether to enable debug mode.
+        wallet_name: Optional wallet profile name from .env.wallets.
     """
     print("\nStep 1/6: Loading configuration...")
     config_data = await load_config(config_path)
-    log_dir = build_grid_log_dir(config_data)
+    if wallet_name:
+        _load_dotenv(wallet_name)
+    log_dir = build_grid_log_dir(config_data, wallet_name=wallet_name)
     initialize(log_dir=log_dir, clear_existing=True)
     from core.services.grid.coordinator import GridCoordinator
     from core.services.grid.implementations import (
@@ -487,6 +583,8 @@ async def main(
         print(f"   - Exchange: {grid_config.exchange}")
         print(f"   - Symbol: {grid_config.symbol}")
         print(f"   - Grid type: {grid_config.grid_type.value}")
+        if wallet_name:
+            print(f"   - Wallet profile: {wallet_name}")
         print(f"   - Log directory: {Path(log_dir)}")
 
         # Spot markets support only long-side grid modes.
@@ -536,7 +634,10 @@ async def main(
 
         # 2. Connect the exchange adapter.
         print("\nStep 2/6: Connecting exchange...")
-        exchange_adapter = await create_exchange_adapter(config_data)
+        exchange_adapter = await create_exchange_adapter(
+            config_data,
+            wallet_name=wallet_name,
+        )
         print(f"Exchange connected successfully: {grid_config.exchange}")
 
         # 3. Create core components.
@@ -699,6 +800,9 @@ Examples:
   # Lighter exchange
   python3 run_grid_trading.py config/grid/lighter_btc_perp_long.yaml --debug
 
+  # TradeXYZ with a named agent wallet profile
+  python3 run_grid_trading.py config/grid/tradexyz_NVDA_long.yaml --wallet-name nvda01
+
 Supported exchanges:
   Backpack    - Perpetual markets (long / short)
   Hyperliquid - Perpetual markets (long / short), spot (long only)
@@ -712,6 +816,7 @@ Notes:
   5. The grid system runs continuously until it is stopped manually.
   6. Use Ctrl+C or Q to exit safely.
   7. DEBUG mode prints detailed logs for troubleshooting.
+  8. Named wallet profiles are loaded from .env.wallets/<name>.env.
         """,
     )
 
@@ -725,6 +830,14 @@ Notes:
         "--debug",
         action="store_true",
         help="Enable DEBUG mode and print detailed diagnostic logs",
+    )
+
+    parser.add_argument(
+        "--wallet-name",
+        "--walletname",
+        dest="wallet_name",
+        type=_validate_wallet_name,
+        help="Use a named wallet profile from .env.wallets/<name>.env",
     )
 
     parser.add_argument(
@@ -743,6 +856,7 @@ if __name__ == "__main__":
 
         # Resolve the config path.
         config_path = args.config
+        wallet_name = args.wallet_name
 
         # Ensure the config file exists before startup.
         if not Path(config_path).exists():
@@ -764,13 +878,16 @@ if __name__ == "__main__":
             print()
 
         # Run the application.
-        asyncio.run(main(config_path, debug=args.debug))
+        asyncio.run(main(config_path, debug=args.debug, wallet_name=wallet_name))
 
     except KeyboardInterrupt:
         print("\nProgram exited")
     except SystemExit:
         # argparse --help and --version trigger SystemExit intentionally.
         pass
+    except WalletProfileError as exc:
+        print(f"\nStartup failed: {exc}")
+        sys.exit(1)
     except Exception as exc:
         print(f"\nStartup failed: {exc}")
         import traceback
