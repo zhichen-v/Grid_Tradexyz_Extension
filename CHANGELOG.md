@@ -7,6 +7,7 @@
 #### 2026-05-19
 
 - Fixed short-grid scalping take-profit placement so aggregate buy TP orders are forced below the current market instead of becoming immediately marketable, blocked short-grid scalping from placing buy TP orders after the tracked position is no longer short, and stopped ambiguous TP retries once position sync shows the prior order likely filled.
+- Fixed short-grid health-check TP coverage accounting so chained base-side sell re-entry orders are no longer counted as buy take-profit coverage, allowing real missing short TP coverage to be reported in the correct direction.
 
 #### 2026-04-28
 
@@ -116,6 +117,7 @@
 
 - 2026-05-19: `.\.venv\Scripts\python.exe -m py_compile core\services\grid\scalping\scalping_manager.py core\services\grid\coordinator\scalping_operations.py`
 - 2026-05-19: Local assertion script covering the TSLA short-grid scalping scenario where `current_price=414.64`, position `-0.6`, and prior realized profit previously produced a marketable buy TP above the market.
+- 2026-05-19: Local assertion script covering short-grid TP coverage classification so buy reverse orders count as TP coverage while chained sell re-entry orders do not.
 
 - 2026-05-16: `.\.venv\Scripts\python.exe -m py_compile setup_agent_wallet.py run_grid_trading.py`
 - 2026-05-16: `uv run python run_grid_trading.py --help`

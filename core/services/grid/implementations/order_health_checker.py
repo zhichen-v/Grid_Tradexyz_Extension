@@ -1580,15 +1580,23 @@ class OrderHealthChecker:
     def _get_tracked_take_profit_price_keys(self) -> set[Tuple[str, str]]:
         """Return normalized price-side keys for locally tracked reverse/TP orders."""
         tp_keys: set[Tuple[str, str]] = set()
-        scalping_tp_id = self._get_scalping_take_profit_order_id()
 
         for order in self._iter_unique_local_pending_orders():
-            if getattr(order, "parent_order_id", None) or (
-                scalping_tp_id and getattr(order, "order_id", None) == scalping_tp_id
-            ):
+            if self._is_tracked_take_profit_order(order):
                 tp_keys.add((self._normalize_price_key(order.price), order.side.value.lower()))
 
         return tp_keys
+
+    def _is_tracked_take_profit_order(self, order: GridOrder) -> bool:
+        """Return whether a local pending order is an exit-side TP order."""
+        if not self._is_reverse_side(order.side):
+            return False
+
+        scalping_tp_id = self._get_scalping_take_profit_order_id()
+        if scalping_tp_id and getattr(order, "order_id", None) == scalping_tp_id:
+            return True
+
+        return bool(getattr(order, "parent_order_id", None))
 
     def _get_scalping_take_profit_order_id(self) -> Optional[str]:
         """Return the active scalping TP order id when scalping mode is enabled."""
