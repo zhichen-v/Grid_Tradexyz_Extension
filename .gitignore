@@ -28,6 +28,7 @@ logs/
 
 CLAUDE.md
 .claude/
+.codegraph/
 
 README_old.md
 AGENTS.md
